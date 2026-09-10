@@ -1,0 +1,11 @@
+# Ignorar archivos de entorno
+.env
+# Ignorar carpetas
+venv/
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# Documento de referencia (no lo usa el servicio en tiempo de ejecución)
+06_Modelo_Reporte_Institucional_1_JEC_2026_1.docx
