@@ -128,6 +128,46 @@ def test_cp11_determinismo():
     assert core.calcular_distribucion_por_criterio(filas) == core.calcular_distribucion_por_criterio(filas)
 
 
+def test_cp13_umbral_30_incluye_solo_una_fila():
+    """5 docentes, 1 aspecto con brecha en 40% de las sesiones; los demás
+    por debajo del 30% -> necesidades_frecuentes[] contiene una sola fila
+    (Especificaciones Funcionales JEC §9, §16 paso 6)."""
+    brechas_por_docente = {
+        0: ["B2"], 1: ["B2"],
+        2: ["B3"],
+        3: [],
+        4: [],
+    }
+    frecuencia = core.calcular_frecuencia_brechas(brechas_por_docente)
+    necesidades = core.clasificar_necesidades_frecuentes(frecuencia)
+
+    assert len(necesidades) == 1
+    assert necesidades[0]["id"] == "B2"
+    assert necesidades[0]["pct"] == 40
+
+
+def test_cp14_ningun_aspecto_alcanza_30_tabla_vacia():
+    """Ningún aspecto alcanza el 30% -> necesidades_frecuentes[] se emite
+    vacío."""
+    brechas_por_docente = {i: (["B3"] if i < 2 else []) for i in range(10)}
+    frecuencia = core.calcular_frecuencia_brechas(brechas_por_docente)
+    necesidades = core.clasificar_necesidades_frecuentes(frecuencia)
+
+    assert necesidades == []
+
+
+def test_enfasis_resolucion_de_problemas():
+    """El 4.º énfasis del programa usa la denominación oficial de la Ficha
+    Técnica / Especificaciones JEC §7 ('Resolución de problemas'), no la
+    que traía producción ('Aprendizaje basado en situaciones y
+    problemas')."""
+    enfasis = core.calcular_enfasis_lectura({})
+    nombres = [e["enfasis"] for e in enfasis]
+
+    assert "Resolución de problemas" in nombres
+    assert "Aprendizaje basado en situaciones y problemas" not in nombres
+
+
 @pytest.mark.skip(
     reason=(
         "CP12 (bloquear/reescribir causalidad inventada por el LLM, ej. "

@@ -265,6 +265,12 @@ UMBRAL_FORTALEZA_PCT_LOGRADO = 60
 # Muestra suficiente: mínimo de sesiones V1 válidas para no usar lenguaje
 # referencial/prudente (ficha técnica, secciones 5 y 14).
 UMBRAL_MUESTRA_INSUFICIENTE = 5
+# Umbral de inclusión en "Aspectos que se requieren analizar con el
+# colegiado" (Especificaciones Funcionales JEC §9 y §16 paso 6): un
+# aspecto entra a esa tabla solo si su frecuencia de necesidad alcanza
+# este %. No es un umbral de prioridad -- por debajo de él, la necesidad
+# puede existir en la distribución pero no aparece en esa tabla.
+UMBRAL_NECESIDAD_FRECUENTE_PCT = 30
 
 # Cursos y cmids de docentes
 CMIDS_DOCENTES_POR_CURSO: dict[int, list[int] | None] = {
@@ -660,15 +666,18 @@ def clasificar_fortalezas(distribucion: list[dict]) -> list[dict]:
 
 
 def clasificar_necesidades_frecuentes(frecuencia_brechas: dict[str, dict]) -> list[dict]:
-    """Necesidades de mejora que aparecen con mayor frecuencia (ficha
-    técnica, sección 9; modelo de reporte, sección 5): todas las brechas
-    definidas por F2 (brechas_identificadas[]) presentes en al menos un
-    docente evaluado, ordenadas de mayor a menor frecuencia. No se
-    infieren brechas nuevas -- se usa tal cual lo que ya calculó
-    seleccionar_brechas_globales/calcular_frecuencia_brechas."""
+    """Aspectos que se requieren analizar con el colegiado (Especificaciones
+    Funcionales JEC §9, §10 sección 5, §16 paso 6): solo las brechas
+    definidas por F2 (brechas_identificadas[]) cuya frecuencia alcanza
+    UMBRAL_NECESIDAD_FRECUENTE_PCT -- el umbral es un FILTRO de inclusión
+    en la tabla, no solo un umbral de lectura. No se infieren brechas
+    nuevas -- se usa tal cual lo que ya calculó
+    seleccionar_brechas_globales/calcular_frecuencia_brechas. Puede
+    devolver una lista vacía si ninguna alcanza el umbral."""
     necesidades = [
         {"id": brecha_id, "n": info["conteo"], "pct": info["pct"]}
         for brecha_id, info in frecuencia_brechas.items()
+        if info["pct"] >= UMBRAL_NECESIDAD_FRECUENTE_PCT
     ]
     necesidades.sort(key=lambda n: -n["pct"])
     return necesidades
@@ -721,7 +730,12 @@ def calcular_enfasis_lectura(distribucion_por_id: dict[str, dict]) -> list[dict]
         ),
     })
     enfasis.append({
-        "enfasis": "Aprendizaje basado en situaciones y problemas",
+        # Denominación oficial de las Especificaciones Funcionales JEC §7
+        # ("Resolución de problemas"). El sistema en producción venía
+        # usando "Aprendizaje basado en situaciones y problemas" -- se
+        # corrige por indicación directa del usuario para eliminar el
+        # desfase con el documento entregado a TI.
+        "enfasis": "Resolución de problemas",
         "aspecto_relacionado": "C1/C2",
         "texto_permitido": (
             "Las situaciones significativas y la demanda cognitiva son aspectos relevantes "
@@ -873,17 +887,21 @@ def _construir_prompt_secciones_narrativas(v: dict) -> str:
         "- Sin retroalimentaciones registradas para esta IE."
     )
 
-    # Resuelto en Python (no se le pide al LLM que compare 5 aspectos y
-    # elija cuál tiene mayor concentración -- ese cálculo, como todos los
-    # demás en este prompt, ya viene hecho para que el LLM solo redacte).
-    top_concentracion = sorted(
-        (c for c in distribucion if c["pct_inicio_en_desarrollo"] > 0),
-        key=lambda c: -c["pct_inicio_en_desarrollo"],
-    )[:2]
-    concentracion_texto = "\n".join(
-        f"- {c['nombre']}: {c['pct_inicio_en_desarrollo']}% en Inicio o En desarrollo"
-        for c in top_concentracion
-    ) or "- Ningún aspecto concentra una proporción relevante en Inicio o En desarrollo."
+    # Corrección pedagógica (Especificaciones Funcionales JEC §9, §11,
+    # §12): el reporte NUNCA señala un aspecto como "el que requiere
+    # mayor atención" ni una necesidad como "la más frecuente" en tono de
+    # conclusión -- decidir qué atender primero es del directivo con su
+    # colegiado en la RTC. Por eso este listado para la síntesis NO se
+    # ordena por % (se mantiene el orden oficial C1→C5) y no lleva
+    # porcentajes: son los aspectos que NO llegaron al umbral de
+    # fortaleza, mencionados de forma neutra.
+    ids_fortalezas_set = {f["id"] for f in fortalezas}
+    aspectos_desarrollo = [
+        c["nombre"] for c in distribucion if c["criterio_id"] not in ids_fortalezas_set
+    ]
+    aspectos_desarrollo_texto = ", ".join(aspectos_desarrollo) or (
+        "(todos los aspectos evaluados alcanzaron el umbral de fortaleza; omite esta cláusula)"
+    )
 
     ids_criterios = ", ".join(f'"{c["criterio_id"]}"' for c in distribucion)
     ids_fortalezas = ", ".join(f'"{f["id"]}"' for f in fortalezas)
@@ -902,16 +920,18 @@ Datos generales:
 Resultados por aspecto evaluado:
 {aspectos_texto}
 
-Necesidades de mejora que aparecen con mayor frecuencia:
+Aspectos que se requieren analizar con el colegiado (solo los que
+alcanzan el umbral de frecuencia -- pueden ser ninguno):
 {necesidades_texto}
 
 Fortalezas identificadas:
 {fortalezas_texto}
 
-Aspecto(s) con mayor concentración de necesidad de fortalecimiento (ya
-calculado -- úsalo tal cual para el segundo párrafo de la síntesis, no
-elijas ni calcules otro):
-{concentracion_texto}
+Aspectos con distinto nivel de desarrollo, en orden neutro -- para
+mencionar EN CONJUNTO en el segundo párrafo de la síntesis, SIN elegir
+ni destacar uno como más urgente que otro, y SIN porcentajes (ya viene
+resuelto, no ordenes ni filtres tú):
+{aspectos_desarrollo_texto}
 
 Retroalimentaciones registradas para los docentes de esta IE (texto libre
 de F2, ya agregado -- NUNCA estén asociadas a un docente identificable en
@@ -970,12 +990,14 @@ estructura como base (banco de redacción del programa):
 1. Panorama cualitativo: qué base favorable tiene la institución (la o
    las fortalezas) y qué aspectos requieren seguir fortaleciéndose (las
    necesidades), en prosa, sin cifras todavía.
-2. Concentración cuantitativa: menciona EXACTAMENTE el/los aspecto(s) y
-   porcentaje(s) que aparecen en "Aspecto(s) con mayor concentración de
-   necesidad de fortalecimiento" arriba (no elijas ni calcules otro), y
-   cierra indicando que esta información es relevante para el
-   diagnóstico pero no permite por sí sola establecer cuál es la
-   necesidad institucional prioritaria.
+2. Distinto nivel de desarrollo: menciona EN CONJUNTO, sin ordenarlos ni
+   destacar uno como más urgente que otro, los aspectos que aparecen en
+   "Aspectos con distinto nivel de desarrollo" arriba (usa exactamente
+   esa lista; si viene vacía, omite este párrafo). No agregues
+   porcentajes aquí -- son un panorama cualitativo, no una comparación.
+   Cierra indicando que esta información es relevante para el
+   diagnóstico, y que decidir qué aspecto analizar primero corresponde
+   al directivo junto con su colegiado, en la RTC.
 3. Contraste y propósito: indica que, para avanzar hacia una comprensión
    institucional, corresponde contrastar estos resultados con MPE, ENLA
    y las evidencias de aprendizaje de los estudiantes; plantea la
@@ -1011,8 +1033,18 @@ Reglas estrictas, sin excepción:
   una etiqueta o encabezado tipo "Síntesis:", "Contraste:", "Fortaleza:",
   "Necesidad:" ni similar -- el nombre de la sección ya lo pone el
   reporte por fuera, el texto que redactas es solo el contenido.
+- NUNCA presentes un aspecto como "el que requiere mayor atención", "el
+  más urgente" o "el prioritario", ni una necesidad como "la más
+  frecuente", en tono de conclusión -- ni en las interpretaciones, ni en
+  las preguntas RTC, ni en la síntesis. El reporte muestra el estado
+  encontrado en las evidencias; decidir qué atender primero es una
+  decisión del directivo con su colegiado, en la RTC.
+- Usa siempre "propósito de aprendizaje", NUNCA "objetivos de
+  aprendizaje" -- especialmente en la interpretación de "Coherencia
+  entre propósito y desafíos", para mantener coherencia con el nombre
+  oficial de ese aspecto.
 - No sugieras acciones, estrategias ni próximos pasos concretos: el
-  reporte describe y prioriza, la decisión queda en manos del directivo.
+  reporte describe, la decisión queda en manos del directivo.
 """.strip()
 
 

@@ -540,7 +540,7 @@
       <p>
         Reporte Institucional 1 — <strong>Sesiones de aprendizaje V1</strong>. Reúne los resultados de las
         Sesiones V1 evaluadas por el programa: qué se observa en cada aspecto, fortalezas identificadas y
-        necesidades de mejora que aparecen con mayor frecuencia. Es insumo del Diagnóstico institucional y de
+        aspectos que se requieren analizar con el colegiado. Es insumo del Diagnóstico institucional y de
         la RTC 1 — no sustituye la conducción del análisis colegiado por el directivo.
       </p>
       <span class="badge good">Sin identificación docente individual</span>
@@ -1043,15 +1043,6 @@ function renderPanoramaGeneral(data) {
     `${data.n_evidencias_validas ?? 0} de ${data.n_docentes_total ?? 0} docentes cuentan con una Sesión V1 válida (${data.pct_cobertura ?? 0}% de cobertura).`
   );
 
-  const distribucion = data.distribucion_por_aspecto || [];
-  if (distribucion.length) {
-    const masAtencion = [...distribucion].sort((a, b) => b.pct_inicio_en_desarrollo - a.pct_inicio_en_desarrollo)[0];
-    addBullet(
-      ul,
-      `El aspecto que requiere mayor atención entre las sesiones revisadas es "${masAtencion.nombre}", con ${masAtencion.pct_inicio_en_desarrollo}% en Inicio o En desarrollo.`
-    );
-  }
-
   const fortalezas = data.fortalezas || [];
   if (fortalezas.length) {
     const top = [...fortalezas].sort((a, b) => b.pct - a.pct)[0];
@@ -1060,11 +1051,16 @@ function renderPanoramaGeneral(data) {
     addBullet(ul, "Ningún aspecto alcanzó todavía el umbral de fortaleza en las sesiones revisadas.");
   }
 
-  const necesidades = data.necesidades_frecuentes || [];
-  if (necesidades.length) {
-    const top = necesidades[0];
-    addBullet(ul, `La necesidad de mejora que aparece con mayor frecuencia es "${top.nombre}" (${top.pct}% de las sesiones).`);
-  }
+  /* Corrección pedagógica (Especificaciones Funcionales JEC §9, §10
+   * sección 1, §12): el panorama general nunca señala un aspecto como
+   * "el que requiere mayor atención" ni una necesidad como "la más
+   * frecuente" -- solo indica de forma neutra que existen distintos
+   * niveles de desarrollo, detallados en las secciones siguientes para
+   * su análisis con el colegiado. */
+  addBullet(
+    ul,
+    "Los resultados muestran distintos niveles de desarrollo entre los aspectos evaluados, que se detallan a continuación para su análisis con el colegiado."
+  );
 
   if (!data.muestra_suficiente) {
     addBullet(ul, "La cantidad de sesiones válidas es reducida: estos resultados deben leerse con prudencia, sin generalizar a toda la institución.");
@@ -1212,24 +1208,24 @@ function tablaSimple(section, columnas, filas, vacioTexto) {
   section.appendChild(wrap);
 }
 
-/* "5. Necesidades de mejora que aparecen con mayor frecuencia" */
+/* "5. Aspectos que se requieren analizar con el colegiado" */
 function capitalizar(texto) {
   if (!texto) return "";
   return texto.charAt(0).toUpperCase() + texto.slice(1);
 }
 
 function renderNecesidades(data) {
-  const section = sectionCard("5. Necesidades de mejora que aparecen con mayor frecuencia");
+  const section = sectionCard("5. Aspectos que se requieren analizar con el colegiado");
   tablaSimple(
     section,
     [
-      { label: "Aspecto que requiere mayor atención", key: "nombre" },
+      { label: "Aspecto a analizar con el colegiado", key: "nombre" },
       { label: "Número de sesiones", key: "n" },
       { label: "Porcentaje", render: (f) => `${f.pct}%` },
       { label: "Qué se observa con mayor frecuencia", render: (f) => capitalizar(f.manifestacion) },
     ],
     data.necesidades_frecuentes || [],
-    "Sin necesidades de mejora frecuentes identificadas en las sesiones revisadas."
+    "Ningún aspecto alcanzó el umbral de frecuencia para esta tabla en las sesiones revisadas."
   );
   return section;
 }
