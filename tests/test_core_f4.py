@@ -54,6 +54,58 @@ def test_cp02_distribucion_c3():
     assert c["pct_logrado_destacado"] == c["pct_logrado"] + c["pct_destacado"]
 
 
+def test_primera_oracion_usa_conteo_exacto_no_derivado_del_pct():
+    """La primera oración de la interpretación (sección 3) debe citar el
+    número EXACTO de sesiones del agrupado predominante -- no un valor
+    reconstruido a partir del porcentaje ya redondeado (eso es lo que
+    podía desalinear el texto frente a la tabla de la sección 2)."""
+    filas = (
+        [_fila(i, 3, "inicio") for i in range(6)]
+        + [_fila(i, 3, "en_desarrollo") for i in range(6, 15)]
+        + [_fila(i, 3, "logrado") for i in range(15, 21)]
+        + [_fila(21, 3, "destacado")]
+    )
+    c = core.calcular_distribucion_por_criterio(filas)[0]
+
+    frase = core._primera_oracion_interpretacion(c)
+
+    # Agrupado predominante: Inicio+En desarrollo (68%) sobre
+    # Logrado+Destacado (32%) -- 6+9=15 sesiones exactas, no 68% de 22
+    # redondeado de otra forma.
+    assert frase == "En 15 de 22 sesiones (68%) se observa Inicio o En desarrollo."
+
+
+def test_completar_huecos_antepone_primera_oracion_y_recorta_duplicado():
+    """_completar_huecos_narrativos debe anteponer siempre la primera
+    oración calculada en Python, y si el LLM además escribió su propia
+    versión numérica al inicio (ignorando la instrucción del prompt),
+    debe recortarla para no duplicar ni contradecir la cifra oficial."""
+    c = core.calcular_distribucion_por_criterio(
+        [_fila(i, 1, "logrado") for i in range(5)]
+    )[0]
+    variables = {
+        "cod_modular": "test",
+        "distribucion_por_aspecto": [c],
+        "fortalezas": [],
+        "necesidades_frecuentes": [],
+    }
+    data_llm = {
+        "interpretaciones": {
+            "C1": "En 999 de 999 sesiones (10%) se observa algo distinto. Esto significa que hay coherencia."
+        },
+        "manifestaciones": {"fortalezas": {}, "necesidades": {}},
+        "preguntas_rtc": ["¿Pregunta?"],
+        "sintesis_institucional": "Síntesis de prueba.",
+    }
+
+    resultado = core._completar_huecos_narrativos(variables, data_llm)
+
+    texto = resultado["interpretaciones"]["C1"]
+    assert texto.startswith(core._primera_oracion_interpretacion(c))
+    assert "999" not in texto
+    assert "Esto significa que hay coherencia." in texto
+
+
 def test_cp03_distribucion_c1_favorable():
     """C1: 1 Inicio, 4 Desarrollo, 13 Logrado, 4 Destacado -> ~22.7%
     requiere mayor desarrollo; ~77.3% favorable."""
@@ -166,6 +218,16 @@ def test_enfasis_resolucion_de_problemas():
 
     assert "Resolución de problemas" in nombres
     assert "Aprendizaje basado en situaciones y problemas" not in nombres
+
+
+def test_zona_lima_offset_fijo_utc_menos_5():
+    """Perú no usa horario de verano: el offset debe ser exactamente
+    -05:00 en cualquier fecha del año, sin depender de tzdata."""
+    from datetime import datetime, timedelta
+
+    assert core.ZONA_LIMA.utcoffset(None) == timedelta(hours=-5)
+    ahora = datetime.now(core.ZONA_LIMA)
+    assert ahora.utcoffset() == timedelta(hours=-5)
 
 
 @pytest.mark.skip(

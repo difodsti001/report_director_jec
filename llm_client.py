@@ -45,7 +45,7 @@ async def generar_texto_narrativo(prompt: str, *, formato_json: bool = False) ->
     response = await client.chat.completions.create(
         model=DEPLOYMENT,
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=2600,
+        max_tokens=3000,
         temperature=0.4,
         **kwargs,
     )
