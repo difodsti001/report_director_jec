@@ -265,7 +265,7 @@ def _nombre_brecha(brecha_id: str) -> str:
     info = BRECHAS.get(brecha_id)
     return info["nombre"] if info else brecha_id
 
-CARGOS_DOCENTE = ("DOCENTE")
+CARGOS_DOCENTE = ("DOCENTE",)
 
 # Prioridad de las brechas (crítica>estructural>de ajuste) y de niveles (inicio>en_desarrollo)
 PRIORIDAD_TIPO = {"Crítica": 3, "Estructural": 2, "De ajuste": 1}
