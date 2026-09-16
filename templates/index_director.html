@@ -1221,7 +1221,7 @@ function renderNecesidades(data) {
     section,
     [
       { label: "Aspecto a analizar con el colegiado", key: "nombre" },
-      { label: "Número de sesiones", key: "n" },
+      { label: "Número de sesiones", render: (f) => `${f.n} de ${data.n_evidencias_validas ?? "—"}` },
       { label: "Porcentaje", render: (f) => `${f.pct}%` },
       { label: "Qué se observa con mayor frecuencia", render: (f) => capitalizar(f.manifestacion) },
     ],
@@ -1238,7 +1238,7 @@ function renderFortalezas(data) {
     section,
     [
       { label: "Fortaleza", key: "nombre" },
-      { label: "Número de sesiones", key: "n" },
+      { label: "Número de sesiones", render: (f) => `${f.n} de ${data.n_evidencias_validas ?? "—"}` },
       { label: "Porcentaje en Logrado o Destacado", render: (f) => `${f.pct}%` },
       { label: "Evidencia encontrada", render: (f) => capitalizar(f.manifestacion) },
     ],

@@ -242,11 +242,47 @@ CRITERIOS: dict[str, dict[str, str]] = {
 # B1-B5 se conservan solo en la capa de datos (campo "id" interno) -- el
 # reporte visible al directivo nunca debe mostrar el código.
 BRECHAS: dict[str, dict[str, str]] = {
-    "B1": {"nombre": "Coherencia del diseño con la información del diagnóstico", "tipo": "Crítica"},
-    "B2": {"nombre": "Participación de los estudiantes y nivel de exigencia de las actividades", "tipo": "Crítica"},
-    "B3": {"nombre": "Situaciones significativas", "tipo": "Estructural"},
-    "B4": {"nombre": "Mediación y evaluación formativa", "tipo": "Estructural"},
-    "B5": {"nombre": "Uso pedagógico de recursos y espacios", "tipo": "De ajuste"},
+    "B1": {
+        "nombre": "Coherencia del diseño con la información del diagnóstico",
+        "tipo": "Crítica",
+        "refiere_a": (
+            "la sesión no siempre se articula con la información del diagnóstico "
+            "previo de los estudiantes (MPE/ENLA/evidencias de aula)."
+        ),
+    },
+    "B2": {
+        "nombre": "Participación de los estudiantes y nivel de exigencia de las actividades",
+        "tipo": "Crítica",
+        "refiere_a": (
+            "las actividades ofrecen oportunidades limitadas para que los "
+            "estudiantes analicen, decidan, argumenten o produzcan respuestas propias."
+        ),
+    },
+    "B3": {
+        "nombre": "Situaciones significativas",
+        "tipo": "Estructural",
+        "refiere_a": (
+            "la situación propuesta no siempre presenta un contexto o desafío "
+            "suficientemente significativo para movilizar el aprendizaje."
+        ),
+    },
+    "B4": {
+        "nombre": "Mediación y evaluación formativa",
+        "tipo": "Estructural",
+        "refiere_a": (
+            "no siempre está prevista una relación clara entre las acciones de "
+            "mediación, la evidencia que se recoge y las decisiones para "
+            "acompañar o ajustar el aprendizaje."
+        ),
+    },
+    "B5": {
+        "nombre": "Uso pedagógico de recursos y espacios",
+        "tipo": "De ajuste",
+        "refiere_a": (
+            "los recursos o espacios seleccionados no siempre tienen una función "
+            "pedagógica claramente vinculada con el propósito."
+        ),
+    },
 }
 
 
@@ -699,9 +735,17 @@ def calcular_frecuencia_brechas(brechas_por_docente: dict[int, list[str]]) -> di
 def clasificar_fortalezas(distribucion: list[dict]) -> list[dict]:
     """Fortaleza: aspecto con >= UMBRAL_FORTALEZA_PCT_LOGRADO% en el
     agrupado de lectura 'Logrado + Destacado' (ficha técnica, sección 5:
-    "Logrado + Destacado" es un recurso de lectura, no un nivel nuevo)."""
+    "Logrado + Destacado" es un recurso de lectura, no un nivel nuevo).
+    "n" es el conteo EXACTO de sesiones en ese agrupado (el numerador de
+    "[n] de [N]"), no el total de sesiones válidas del aspecto -- antes
+    se usaba el total por error, lo que hacía que "n" fuera siempre igual
+    al total sin importar el %."""
     return [
-        {"id": c["criterio_id"], "n": c["n"], "pct": c["pct_logrado_destacado"]}
+        {
+            "id": c["criterio_id"],
+            "n": c["n_logrado"] + c["n_destacado"],
+            "pct": c["pct_logrado_destacado"],
+        }
         for c in distribucion
         if c["pct_logrado_destacado"] >= UMBRAL_FORTALEZA_PCT_LOGRADO
     ]
@@ -923,13 +967,15 @@ def _construir_prompt_secciones_narrativas(v: dict) -> str:
         for c in distribucion
     )
     necesidades_texto = "\n".join(
-        f"- {n['nombre']} (id interno {n['id']}): presente en {n['n']} de "
+        f"- {n['nombre']} (id interno {n['id']}, refiere a: "
+        f"{BRECHAS.get(n['id'], {}).get('refiere_a', '')}): presente en {n['n']} de "
         f"{v['n_evidencias_validas']} sesiones ({n['pct']}%)"
         for n in necesidades
     ) or "- Ninguna necesidad frecuente identificada."
     fortalezas_texto = "\n".join(
-        f"- {f['nombre']} (id interno {f['id']}): {f['n']} de {v['n_evidencias_validas']} "
-        f"sesiones ({f['pct']}%) en Logrado o Destacado"
+        f"- {f['nombre']} (id interno {f['id']}, evalúa: "
+        f"{CRITERIOS.get(f['id'], {}).get('que_evalua', '')}): {f['n']} de "
+        f"{v['n_evidencias_validas']} sesiones ({f['pct']}%) en Logrado o Destacado"
         for f in fortalezas
     ) or "- Ninguna alcanzó el umbral de fortaleza."
     retroalimentaciones_texto = "\n".join(f"- {r}" for r in retroalimentaciones) or (
@@ -1047,13 +1093,13 @@ pedagógica -- una frase breve en minúscula que complete naturalmente,
 SIN repetir el nombre del aspecto ni las cifras (eso ya lo arma el
 sistema por fuera): para fortalezas, algo que podría continuar "Las
 evidencias muestran ..."; para necesidades, algo que podría continuar
-"En estas sesiones se observa ...". Ejemplo de fortaleza: "una relación
-clara y consistente entre el propósito de la sesión y el desafío
-planteado a los estudiantes". Ejemplo de necesidad: "actividades que
-ofrecen oportunidades limitadas para que los estudiantes analicen,
-decidan o argumenten". NUNCA antepongas una etiqueta como "Fortaleza:"
-o "Necesidad:" -- es solo el fragmento de texto, no una oración
-completa ni un título.
+"En estas sesiones se observa ...". CADA fragmento debe estar basado
+ESPECÍFICAMENTE en el "evalúa" (fortalezas) o "refiere a" (necesidades)
+de ESE id -- nunca reutilices ni mezcles el contenido de un id con el de
+otro, aunque el tema te parezca similar; cada fila de la tabla debe
+poder sostenerse sola, sin depender de las demás. NUNCA antepongas una
+etiqueta como "Fortaleza:" o "Necesidad:" -- es solo el fragmento de
+texto, no una oración completa ni un título.
 
 Para "preguntas_rtc", genera de 4 a 6 preguntas movilizadoras abiertas
 para preparar la RTC 1, orientadas al análisis colectivo del equipo

@@ -54,6 +54,27 @@ def test_cp02_distribucion_c3():
     assert c["pct_logrado_destacado"] == c["pct_logrado"] + c["pct_destacado"]
 
 
+def test_clasificar_fortalezas_usa_numerador_exacto_no_el_total():
+    """El "n" de una fortaleza debe ser el conteo EXACTO de sesiones en
+    Logrado+Destacado (el numerador de "[n] de [N]"), no el total de
+    sesiones válidas del aspecto -- antes se usaba el total por error, lo
+    que hacía que "n" fuera siempre igual a "N" (100%) sin importar el %
+    real mostrado en la tabla."""
+    # C1: 2 Inicio, 0 Desarrollo, 10 Logrado, 8 Destacado -> 20 sesiones,
+    # 90% Logrado+Destacado (18 de 20, no 20 de 20).
+    filas = (
+        [_fila(i, 1, "inicio") for i in range(2)]
+        + [_fila(i, 1, "logrado") for i in range(2, 12)]
+        + [_fila(i, 1, "destacado") for i in range(12, 20)]
+    )
+    distribucion = core.calcular_distribucion_por_criterio(filas)
+    fortalezas = core.clasificar_fortalezas(distribucion)
+
+    assert len(fortalezas) == 1
+    assert fortalezas[0]["pct"] == 90
+    assert fortalezas[0]["n"] == 18  # 10 Logrado + 8 Destacado, no los 20 totales
+
+
 def test_primera_oracion_usa_conteo_exacto_no_derivado_del_pct():
     """La primera oración de la interpretación (sección 3) debe citar el
     número EXACTO de sesiones del agrupado predominante -- no un valor
@@ -104,6 +125,41 @@ def test_completar_huecos_antepone_primera_oracion_y_recorta_duplicado():
     assert texto.startswith(core._primera_oracion_interpretacion(c))
     assert "999" not in texto
     assert "Esto significa que hay coherencia." in texto
+
+
+def test_brechas_tienen_refiere_a_para_anclar_el_prompt():
+    """Todas las brechas B1-B5 deben tener su propio texto 'refiere_a' --
+    si se agrega una brecha nueva sin ese campo, el prompt quedaría sin
+    anclaje semántico específico para su manifestación (ver
+    _construir_prompt_secciones_narrativas)."""
+    for brecha_id, info in core.BRECHAS.items():
+        assert info.get("refiere_a"), f"{brecha_id} no tiene 'refiere_a'"
+
+
+def test_prompt_ancla_manifestacion_de_necesidad_en_su_propio_aspecto():
+    """Reproduce el bug reportado: la manifestación de una necesidad
+    (ej. B4 'Mediación y evaluación formativa') no debe poder confundirse
+    con la de otro aspecto (ej. B2, sobre demanda cognitiva) -- el prompt
+    debe anclar cada necesidad con el 'refiere_a' de SU PROPIA brecha, no
+    uno genérico ni copiable entre aspectos."""
+    variables = {
+        "cod_modular": "test",
+        "nombre_ie": "IE de prueba",
+        "n_docentes_total": 5,
+        "n_evidencias_validas": 5,
+        "pct_cobertura": 100,
+        "muestra_suficiente": True,
+        "distribucion_por_aspecto": [],
+        "necesidades_frecuentes": [{"id": "B4", "nombre": "Mediación y evaluación formativa", "n": 2, "pct": 40}],
+        "fortalezas": [],
+        "retroalimentaciones": [],
+    }
+    prompt = core._construir_prompt_secciones_narrativas(variables)
+
+    refiere_a_b4 = core.BRECHAS["B4"]["refiere_a"]
+    refiere_a_b2 = core.BRECHAS["B2"]["refiere_a"]
+    assert refiere_a_b4 in prompt
+    assert refiere_a_b2 not in prompt
 
 
 def test_cp03_distribucion_c1_favorable():
