@@ -212,6 +212,55 @@ def test_cp06_no_infiere_brecha_no_provista():
     assert core.seleccionar_brechas_globales(filas_docente) == []
 
 
+def test_seleccionar_brechas_globales_no_truena_con_criterion_index_none():
+    """Fix de crash en producción: una fila 'success' con criterion_index
+    NULL (docente a medio cargar en F2) no debe romper el ordenamiento
+    por comparar None con int -- debe quedar al final del orden, no
+    provocar un TypeError."""
+    filas_docente = [
+        {"criterion_index": None, "nivel_obtenido": "inicio", "brecha": "B1", "tipo_brecha": "Crítica"},
+        {"criterion_index": 2, "nivel_obtenido": "inicio", "brecha": "B2", "tipo_brecha": "Crítica"},
+    ]
+    resultado = core.seleccionar_brechas_globales(filas_docente)
+    assert set(resultado) == {"B1", "B2"}
+
+
+def test_calcular_distribucion_descarta_fila_sin_criterion_index():
+    """Fix de crash en producción: una fila 'success' con criterion_index
+    NULL se descarta del cálculo (no se puede atribuir a ningún aspecto)
+    en vez de romper la agrupación."""
+    filas = [
+        {"criterion_index": None, "nivel_obtenido": "logrado", "user_id": 99},
+        {"criterion_index": 1, "nivel_obtenido": "logrado", "user_id": 1},
+    ]
+    resultado = core.calcular_distribucion_por_criterio(filas)
+    assert len(resultado) == 1
+    assert resultado[0]["criterio_id"] == "C1"
+    assert resultado[0]["n"] == 1
+
+
+def test_excluir_docentes_con_registro_incompleto():
+    """Un docente con alguna fila 'success' sin criterion_index, nivel_
+    obtenido o nivel_educativo se excluye COMPLETO -- no solo la fila
+    rota -- para que sus otros aspectos ya cargados no generen un 'n de
+    N' inconsistente entre secciones."""
+    filas = [
+        # Docente 1: completo, 2 filas success.
+        _fila(1, 1, "logrado"),
+        _fila(1, 2, "logrado"),
+        # Docente 2: una fila incompleta (sin criterion_index) -- se
+        # excluye TODO el docente, incluida su fila 1 que sí está completa.
+        _fila(2, 1, "logrado"),
+        {**_fila(2, 2, "logrado"), "criterion_index": None},
+        # Docente 3: no válida, no debe verse afectado por la regla
+        # (la regla solo aplica a filas 'success').
+        _fila(3, 1, "inicio", status="validation_failed"),
+    ]
+    resultado = core._excluir_docentes_con_registro_incompleto(filas)
+    user_ids_restantes = {f["user_id"] for f in resultado}
+    assert user_ids_restantes == {1, 3}
+
+
 def test_cp07_muestra_insuficiente():
     """4 evidencias válidas -> por debajo del umbral, debe usarse lenguaje
     prudente (muestra_suficiente=False)."""
@@ -234,6 +283,32 @@ def test_cp11_determinismo():
     cuantitativo."""
     filas = [_fila(i, c, "logrado") for i in range(10) for c in range(1, 6)]
     assert core.calcular_distribucion_por_criterio(filas) == core.calcular_distribucion_por_criterio(filas)
+
+
+def test_debe_esperar_mas_docentes_ie_grande_bajo_piso_absoluto():
+    """IE grande (200 docentes), solo 4 evaluados -> por debajo del piso
+    absoluto (5) Y del 35% -> debe esperar."""
+    assert core._debe_esperar_mas_docentes(n_actual=4, pct_cobertura_actual=2) is True
+
+
+def test_debe_esperar_mas_docentes_ie_grande_sobre_piso_bajo_cobertura():
+    """IE grande (200 docentes), 5 evaluados (piso absoluto cumplido) pero
+    solo 3% de cobertura -> igual debe esperar: el piso absoluto solo no
+    basta para una IE grande."""
+    assert core._debe_esperar_mas_docentes(n_actual=5, pct_cobertura_actual=3) is True
+
+
+def test_debe_esperar_mas_docentes_ie_mediana_cumple_ambos_umbrales():
+    """IE mediana (14 docentes), 5 evaluados -> 36% de cobertura, cumple
+    ambos umbrales -> ya no debe esperar."""
+    assert core._debe_esperar_mas_docentes(n_actual=5, pct_cobertura_actual=36) is False
+
+
+def test_debe_esperar_mas_docentes_ie_pequena_escape_100_por_ciento():
+    """IE muy pequeña (3 docentes en total): nunca alcanzaría ni el piso
+    absoluto (5) ni el 35% de forma normal, pero si ya se evaluó al 100%
+    de la plana docente, se genera igual (escape)."""
+    assert core._debe_esperar_mas_docentes(n_actual=3, pct_cobertura_actual=100) is False
 
 
 def test_cp13_umbral_30_incluye_solo_una_fila():

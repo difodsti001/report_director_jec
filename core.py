@@ -318,6 +318,12 @@ UMBRAL_MUESTRA_INSUFICIENTE = 5
 # este %. No es un umbral de prioridad -- por debajo de él, la necesidad
 # puede existir en la distribución pero no aparece en esa tabla.
 UMBRAL_NECESIDAD_FRECUENTE_PCT = 30
+# Cobertura mínima (sobre el total de docentes de la IE) para generar el
+# reporte sin esperar más evaluaciones -- ver _debe_esperar_mas_docentes.
+# Complementa a UMBRAL_MUESTRA_INSUFICIENTE: ese piso absoluto (5) por sí
+# solo es insuficiente en IEs grandes (5 de 100 docentes es 5% de
+# cobertura, poco representativo institucionalmente).
+UMBRAL_COBERTURA_MINIMA_PCT = 35
 
 # Cursos y cmids de docentes
 CMIDS_DOCENTES_POR_CURSO: dict[int, list[int] | None] = {
@@ -500,28 +506,43 @@ def _normalizar_nivel_obtenido(rows: list[dict]) -> None:
 
 async def contar_docentes_evaluados(nombre_ie: str, region: str, distrito: str, nivel_educativo: Optional[str] = None) -> int:
     """
-    Cuenta cuántos docentes DISTINTOS tienen al menos una evidencia
-    'success' para esta IE, sin traer las filas completas. Más liviana
-    que obtener_filas_vista + agrupar_por_docente -- usada por el
-    endpoint de consulta (que debe ser rápido) para decidir la acción
-    sin pagar el costo de traer todo el detalle por criterio. Si
-    nivel_educativo es None, cuenta los 3 niveles juntos (usado para el
-    mínimo de activación de UMBRAL_MUESTRA_INSUFICIENTE sobre la IE
-    completa).
+    Cuenta cuántos docentes DISTINTOS tienen evidencia 'success' completa
+    (todas sus filas con criterion_index, nivel_obtenido y
+    nivel_educativo no nulos) para esta IE, sin traer las filas
+    completas. Más liviana que obtener_filas_vista + agrupar_por_docente
+    -- usada por el endpoint de consulta (que debe ser rápido) para
+    decidir la acción sin pagar el costo de traer todo el detalle por
+    criterio. Si nivel_educativo es None, cuenta los 3 niveles juntos
+    (usado para el mínimo de activación de UMBRAL_MUESTRA_INSUFICIENTE
+    sobre la IE completa).
+
+    Un docente con alguna fila 'success' sin criterion_index (carga de F2
+    todavía en curso) NO cuenta como evaluado -- misma regla que
+    _excluir_docentes_con_registro_incompleto usa al generar el reporte,
+    para que el conteo que decide "hay novedades, regenerar" y el
+    contenido real del reporte nunca queden desalineados.
     """
     cmids_validos = _cmids_docentes_configurados()
     if not cmids_validos:
         return 0
 
     query = """
+        WITH filas AS (
+            SELECT user_id, criterion_index, nivel_obtenido, nivel_educativo
+            FROM public.vw_processing_brechas_jec
+            WHERE nombre_ie = %(nombre_ie)s
+              AND "región" = %(region)s
+              AND distrito IS NOT DISTINCT FROM %(distrito)s
+              AND cmid = ANY(%(cmids_validos)s)
+              AND status = 'success'
+              AND (%(nivel_educativo)s::text IS NULL OR nivel_educativo = %(nivel_educativo)s::text)
+        )
         SELECT COUNT(DISTINCT user_id) AS total
-        FROM public.vw_processing_brechas_jec
-        WHERE nombre_ie = %(nombre_ie)s
-          AND "región" = %(region)s
-          AND distrito IS NOT DISTINCT FROM %(distrito)s
-          AND cmid = ANY(%(cmids_validos)s)
-          AND status = 'success'
-          AND (%(nivel_educativo)s::text IS NULL OR nivel_educativo = %(nivel_educativo)s::text)
+        FROM filas
+        WHERE user_id NOT IN (
+            SELECT user_id FROM filas
+            WHERE criterion_index IS NULL OR nivel_obtenido IS NULL OR nivel_educativo IS NULL
+        )
     """
     async with pool_datos.connection() as conn:
         row = await (await conn.execute(
@@ -556,6 +577,33 @@ def filas_validas(filas: list[dict]) -> list[dict]:
     (distribución por aspecto, brechas, fortalezas): esos cálculos nunca
     deben incluir evidencia no válida o sin entrega real."""
     return [f for f in filas if f["status"] == "success"]
+
+
+_COLUMNAS_REQUERIDAS_SI_SUCCESS = ("criterion_index", "nivel_obtenido", "nivel_educativo")
+
+
+def _excluir_docentes_con_registro_incompleto(filas: list[dict]) -> list[dict]:
+    """Si un docente tiene alguna fila 'success' con alguna columna clave
+    en NULL (criterion_index, nivel_obtenido o nivel_educativo), su carga
+    en la vista todavía está en curso (F2 parece insertar la fila del
+    docente antes de completarla) -- se excluye al docente COMPLETO de
+    este cálculo, no solo la fila incompleta. Contar solo sus otros
+    aspectos ya cargados produciría un 'n de N' distinto entre secciones
+    para el mismo docente. En el siguiente refresco de caché, cuando la
+    carga termine, vuelve a contarse con normalidad."""
+    por_docente = agrupar_por_docente(filas)
+    incompletos = {
+        user_id
+        for user_id, filas_docente in por_docente.items()
+        if any(
+            f["status"] == "success" and f.get(col) is None
+            for f in filas_docente
+            for col in _COLUMNAS_REQUERIDAS_SI_SUCCESS
+        )
+    }
+    if incompletos:
+        log.warning("docentes_con_registro_incompleto_excluidos", user_ids=sorted(incompletos))
+    return [f for f in filas if f["user_id"] not in incompletos]
 
 
 def _extraer_retroalimentaciones(filas_por_docente: dict[int, list[dict]]) -> list[str]:
@@ -639,7 +687,7 @@ def seleccionar_brechas_globales(filas_docente: list[dict]) -> list[str]:
         key=lambda f: (
             -PRIORIDAD_TIPO.get(f["tipo_brecha"], 0),
             -PRIORIDAD_NIVEL.get(f["nivel_obtenido"], 0),
-            f["criterion_index"],
+            f["criterion_index"] if f["criterion_index"] is not None else 999,
         ),
     )
     return [f["brecha"] for f in candidatas_ordenadas[:2]]
@@ -656,6 +704,13 @@ def calcular_distribucion_por_criterio(filas: list[dict]) -> list[dict]:
 
     for fila in filas:
         c = fila["criterion_index"]
+        if c is None:
+            # Fila 'success' pero sin criterion_index -- registro
+            # incompleto en la vista de origen. Se descarta (no se puede
+            # atribuir a ningún aspecto) en vez de romper el ordenamiento
+            # o distorsionar los conteos.
+            log.warning("fila_sin_criterion_index_descartada", user_id=fila.get("user_id"))
+            continue
         nivel = fila["nivel_obtenido"]
         conteos = por_criterio.setdefault(
             c, {"inicio": 0, "en_desarrollo": 0, "logrado": 0, "destacado": 0}
@@ -1375,6 +1430,8 @@ async def generar_reporte(cod_modular: str, nombre_ie: str, region: str, distrit
     if not todas_las_filas:
         raise SinDatosDisponiblesError(f"Sin datos en la vista para {cod_modular}")
 
+    todas_las_filas = _excluir_docentes_con_registro_incompleto(todas_las_filas)
+
     n_docentes_total = await contar_docentes_total(nombre_ie, region, distrito)
     estados = clasificar_evidencias_por_estado(todas_las_filas, n_docentes_total)
     n_evidencias_validas = estados["n_validas"]
@@ -1559,15 +1616,36 @@ async def registrar_consulta(
 # Puntos de entrada
 # =============================================================================
 
+def _debe_esperar_mas_docentes(n_actual: int, pct_cobertura_actual: int) -> bool:
+    """Decide si /reporte/consultar debe indicarle al frontend que espere
+    más docentes evaluados en vez de generar el reporte ya.
+
+    Se exige alcanzar AMBOS umbrales -- el piso absoluto
+    (UMBRAL_MUESTRA_INSUFICIENTE) y el de cobertura proporcional
+    (UMBRAL_COBERTURA_MINIMA_PCT) -- porque el piso absoluto por sí solo
+    es insuficiente en IEs grandes: 5 docentes evaluados en una IE de 100
+    son solo 5% de cobertura, poco representativo para un reporte
+    institucional.
+
+    Excepción: si ya se evaluó al 100% de la plana docente de la IE, se
+    genera igual aunque no se hayan alcanzado ni los 5 ni el 35% -- en
+    IEs muy pequeñas (menos docentes en total que el piso o que el %
+    mínimo) ninguno de los dos umbrales se alcanzaría nunca, así que
+    evaluar a todos sin excepción siempre habilita el reporte."""
+    if pct_cobertura_actual >= 100:
+        return False
+    return n_actual < UMBRAL_MUESTRA_INSUFICIENTE or pct_cobertura_actual < UMBRAL_COBERTURA_MINIMA_PCT
+
+
 async def consultar_reporte_existente(userid: int) -> dict:
     """
     GET /reporte/consultar -- endpoint rápido de solo lectura, que además
     decide qué debe hacer el frontend a continuación, sin generar nada
     él mismo (nunca toca el LLM). Cuatro situaciones:
 
-      1. No hay reporte, y ya hay >= UMBRAL_MUESTRA_INSUFICIENTE docentes
-         con evidencia válida en la IE completa -> accion="generar" (el
-         frontend llama a POST /reporte/generar automáticamente, sin
+      1. No hay reporte, y ya se alcanzaron los umbrales mínimos de
+         evaluación (ver _debe_esperar_mas_docentes) -> accion="generar"
+         (el frontend llama a POST /reporte/generar automáticamente, sin
          botón visible).
       2. Hay reporte, y el número de docentes con evidencia válida no
          cambió desde que se generó -> accion="mostrar", reporte vigente
@@ -1575,14 +1653,17 @@ async def consultar_reporte_existente(userid: int) -> dict:
       3. Hay reporte, pero el número de docentes con evidencia válida
          cambió -> accion="generar" (el frontend dispara la
          regeneración).
-      4. No hay reporte, y aún no se llega al mínimo de docentes
-         evaluados NI se cubrió el 100% de la plana docente de la IE
-         completa -> accion="esperar_docentes". Si una IE ya evaluó a
-         TODOS sus docentes (aunque sean menos de 5 en total), no tiene
-         sentido esperar más -- se genera igual, marcado como
-         muestra_suficiente=False en el reporte.
+      4. No hay reporte, y todavía no se alcanzan los umbrales mínimos
+         -> accion="esperar_docentes". Si una IE ya evaluó al 100% de su
+         plana docente (aunque nunca llegue a los umbrales mínimos por
+         tener muy pocos docentes en total), no tiene sentido esperar
+         más -- se genera igual, marcado como muestra_suficiente=False
+         en el reporte.
 
-    Retorna siempre {"accion": ..., "reporte": ... | None, "n_docentes_evaluados": ...}
+    Retorna siempre {"accion": ..., "reporte": ... | None,
+    "n_docentes_evaluados": ..., "n_docentes_total": ...,
+    "pct_cobertura_actual": ...} -- los dos últimos permiten que el
+    frontend explique el motivo de la espera (ver showEsperandoDocentes).
     """
     inicio = time.monotonic()
     log.info("reporte_consultado", userid=userid)
@@ -1599,8 +1680,7 @@ async def consultar_reporte_existente(userid: int) -> dict:
     duracion_ms = round((time.monotonic() - inicio) * 1000)
 
     if guardado is None:
-        debe_esperar = n_actual < UMBRAL_MUESTRA_INSUFICIENTE and pct_cobertura_actual < 100
-        if debe_esperar:
+        if _debe_esperar_mas_docentes(n_actual, pct_cobertura_actual):
             log.info(
                 "consulta_esperar_docentes",
                 cod_modular=cod_modular,
@@ -1608,7 +1688,13 @@ async def consultar_reporte_existente(userid: int) -> dict:
                 pct_cobertura=pct_cobertura_actual,
                 duracion_ms=duracion_ms,
             )
-            return {"accion": "esperar_docentes", "reporte": None, "n_docentes_evaluados": n_actual}
+            return {
+                "accion": "esperar_docentes",
+                "reporte": None,
+                "n_docentes_evaluados": n_actual,
+                "n_docentes_total": n_total,
+                "pct_cobertura_actual": pct_cobertura_actual,
+            }
 
         log.info(
             "consulta_debe_generar",
@@ -1617,7 +1703,13 @@ async def consultar_reporte_existente(userid: int) -> dict:
             n_docentes_evaluados=n_actual,
             duracion_ms=duracion_ms,
         )
-        return {"accion": "generar", "reporte": None, "n_docentes_evaluados": n_actual}
+        return {
+            "accion": "generar",
+            "reporte": None,
+            "n_docentes_evaluados": n_actual,
+            "n_docentes_total": n_total,
+            "pct_cobertura_actual": pct_cobertura_actual,
+        }
 
     if n_actual != guardado["n_docentes_evaluados"]:
         log.info(
@@ -1628,10 +1720,22 @@ async def consultar_reporte_existente(userid: int) -> dict:
             n_docentes_evaluados=n_actual,
             duracion_ms=duracion_ms,
         )
-        return {"accion": "generar", "reporte": None, "n_docentes_evaluados": n_actual}
+        return {
+            "accion": "generar",
+            "reporte": None,
+            "n_docentes_evaluados": n_actual,
+            "n_docentes_total": n_total,
+            "pct_cobertura_actual": pct_cobertura_actual,
+        }
 
     log.info("consulta_mostrar_vigente", cod_modular=cod_modular, duracion_ms=duracion_ms)
-    return {"accion": "mostrar", "reporte": guardado["reporte_json"], "n_docentes_evaluados": n_actual}
+    return {
+        "accion": "mostrar",
+        "reporte": guardado["reporte_json"],
+        "n_docentes_evaluados": n_actual,
+        "n_docentes_total": n_total,
+        "pct_cobertura_actual": pct_cobertura_actual,
+    }
 
 
 async def obtener_o_generar_reporte(userid: int, courseid: int, cmid: int) -> dict:
@@ -1643,10 +1747,14 @@ async def obtener_o_generar_reporte(userid: int, courseid: int, cmid: int) -> di
          actual vs guardado; si cambió, recalcula; si no, sirve el guardado.
       4. Si hay fila con estado distinto de 'generado' (intento previo
          fallido) -> reintenta generar con los datos actuales.
-      5. Cualquier intento (éxito o falla) actualiza el estado guardado,
-         para que el directivo sepa por qué no tiene informe todavía.
+      5. Si la generación falla por falta de datos (SinDatosDisponiblesError)
+         y YA había un reporte vigente ('generado'), no se degrada el
+         caché -- se sigue sirviendo el último reporte bueno conocido
+         (protege contra huecos transitorios del pipeline de datos, ej.
+         un reprocesamiento que deja la vista momentáneamente vacía).
+         Solo se marca 'sin_datos' cuando nunca hubo un reporte generado.
       6. Registra la asociación directivo-reporte solo si se logra
-         generar (courseid/cmid: trazabilidad).
+         generar o servir un reporte (courseid/cmid: trazabilidad).
     """
     inicio = time.monotonic()
     log.info("reporte_solicitado", userid=userid, courseid=courseid, cmid=cmid)
@@ -1665,8 +1773,16 @@ async def obtener_o_generar_reporte(userid: int, courseid: int, cmid: int) -> di
     )
 
     if guardado is not None and guardado["estado"] == "generado":
-        filas_actuales = filas_validas(await obtener_filas_vista(nombre_ie, region, distrito))
-        n_actual = len(agrupar_por_docente(filas_actuales))
+        # Reusa contar_docentes_evaluados (la misma función que usa
+        # GET /reporte/consultar) en vez de recalcular manualmente con
+        # obtener_filas_vista + filas_validas + agrupar_por_docente --
+        # esa segunda vía NO aplicaba la exclusión de docentes con
+        # registro incompleto, así que quedaba desincronizada de
+        # n_evidencias_validas (que sí la aplica, en generar_reporte) y
+        # podía disparar una regeneración en CADA llamada mientras algún
+        # docente tuviera una carga a medias, aunque nada hubiera
+        # cambiado realmente.
+        n_actual = await contar_docentes_evaluados(nombre_ie, region, distrito)
         debe_generar = n_actual != guardado["n_docentes_evaluados"]
         if debe_generar:
             log.info(
@@ -1685,11 +1801,27 @@ async def obtener_o_generar_reporte(userid: int, courseid: int, cmid: int) -> di
         try:
             reporte = await generar_reporte(cod_modular, nombre_ie, region, distrito)
         except SinDatosDisponiblesError:
-            await guardar_estado_reporte(cod_modular, "sin_datos", 0)
-            raise
-        id_reporte = await guardar_estado_reporte(
-            cod_modular, "generado", reporte["n_evidencias_validas"], reporte
-        )
+            if guardado is not None and guardado["estado"] == "generado":
+                # Vacío transitorio (ej. reprocesamiento del pipeline de
+                # datos que deja la vista momentáneamente sin filas para
+                # esta IE): no se degrada un reporte que ya estaba
+                # vigente -- se sigue sirviendo el último bueno conocido
+                # y se reintenta en la próxima consulta, en vez de
+                # romper el dashboard por un hueco momentáneo de datos.
+                log.warning(
+                    "vista_vacia_transitoria_se_mantiene_reporte_anterior",
+                    cod_modular=cod_modular,
+                    n_docentes_guardado=guardado["n_docentes_evaluados"],
+                )
+                id_reporte = guardado["id"]
+                reporte = guardado["reporte_json"]
+            else:
+                await guardar_estado_reporte(cod_modular, "sin_datos", 0)
+                raise
+        else:
+            id_reporte = await guardar_estado_reporte(
+                cod_modular, "generado", reporte["n_evidencias_validas"], reporte
+            )
 
     await registrar_consulta(cod_modular, userid, courseid, cmid, id_reporte)
 

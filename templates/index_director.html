@@ -628,10 +628,10 @@ const CTX = {
   cmid: params.get("cmid"),
 };
 
-// Debe coincidir con core.UMBRAL_MUESTRA_INSUFICIENTE del backend. Solo se
-// usa para el texto de progreso ("N de 5 sesiones válidas"); la decisión
-// real siempre la toma el backend (accion="esperar_docentes" / 409).
-const UMBRAL_MUESTRA_INSUFICIENTE = 5;
+// Debe coincidir con core.UMBRAL_COBERTURA_MINIMA_PCT del backend. Solo
+// se usa para el texto de progreso; la decisión real siempre la toma el
+// backend (accion="esperar_docentes" / 409).
+const UMBRAL_COBERTURA_MINIMA_PCT = 35;
 
 /* ---------------------------------------------------------------------
  * DOM references
@@ -722,14 +722,24 @@ function showOnly(...visibleIds) {
  * backend nunca llama al LLM en este caso (ni /consultar ni un intento de
  * /generar que reciba 409), así que no hay botón de reintento: el reporte
  * aparecerá solo cuando se alcance el mínimo. */
-function showEsperandoDocentes(nEvidenciasValidas) {
-  const n = nEvidenciasValidas ?? 0;
+function showEsperandoDocentes(info) {
+  const n = info?.n_docentes_evaluados ?? 0;
+  const nTotal = info?.n_docentes_total;
+  const pct = info?.pct_cobertura_actual;
   el.contextName.textContent = "Esperando Sesiones de aprendizaje V1…";
   el.btnRefresh.hidden = true;
-  el.esperandoDocentesText.textContent =
-    `Aún no se alcanza el mínimo de ${UMBRAL_MUESTRA_INSUFICIENTE} sesiones V1 válidas para generar ` +
-    `el reporte institucional (${n} de ${UMBRAL_MUESTRA_INSUFICIENTE} hasta el momento). El reporte se ` +
-    "generará automáticamente en cuanto se alcance el mínimo.";
+
+  // La decisión real (ver _debe_esperar_mas_docentes en el backend)
+  // combina un piso absoluto de docentes con el % de cobertura, pero acá
+  // solo se comunica la cobertura -- es el dato relevante para el
+  // directivo. Si por algún motivo no llega n_docentes_total/pct, se cae
+  // a un mensaje simple con el conteo de docentes evaluados.
+  el.esperandoDocentesText.textContent = (nTotal && pct !== undefined)
+    ? `Aún no se alcanza la cobertura mínima para generar el reporte institucional: se requiere el ` +
+      `${UMBRAL_COBERTURA_MINIMA_PCT}% de cobertura. Cobertura actual: ${pct}% (${n} de ${nTotal} docentes). ` +
+      "El reporte se generará automáticamente en cuanto se alcance el mínimo."
+    : `Aún no se alcanza la cobertura mínima para generar el reporte institucional (${n} docentes ` +
+      "evaluados hasta el momento). El reporte se generará automáticamente en cuanto se alcance el mínimo.";
   showOnly("esperando-docentes");
 }
 
@@ -775,7 +785,7 @@ async function init() {
     if (data.accion === "esperar_docentes") {
       // Aún no llega al mínimo de sesiones V1 válidas: NO se llama a
       // generar (el backend gastaría una llamada al LLM sin necesidad).
-      showEsperandoDocentes(data.n_docentes_evaluados);
+      showEsperandoDocentes(data);
       return;
     }
 
@@ -843,13 +853,13 @@ async function generarReporte() {
       // Muestra insuficiente: reintentar no sirve de nada hasta que haya
       // más sesiones V1 válidas. Se vuelve a consultar (endpoint liviano,
       // no toca el LLM) solo para mostrar el progreso actual.
-      let n;
+      let info;
       try {
-        n = (await apiConsultar(CTX.userid)).n_docentes_evaluados;
+        info = await apiConsultar(CTX.userid);
       } catch {
-        n = undefined;
+        info = undefined;
       }
-      showEsperandoDocentes(n);
+      showEsperandoDocentes(info);
       return;
     }
 
