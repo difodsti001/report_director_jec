@@ -251,7 +251,12 @@
       line-height: 1.55;
       color: var(--text-primary);
     }
-    .cobertura-warning-banner p strong { color: var(--status-warning); }
+    /* La etiqueta "Advertencia de cobertura." va en el color de acento
+     * (ámbar); la frase resaltada dentro del cuerpo del texto usa el
+     * color de texto normal -- el ámbar sobre el fondo ámbar claro del
+     * banner pierde contraste y se vuelve ilegible. */
+    .cobertura-warning-banner p strong.cobertura-warning-label { color: var(--status-warning); }
+    .cobertura-warning-banner p strong.cobertura-warning-highlight { color: var(--text-primary); }
 
     .loading {
       color: var(--text-secondary);
@@ -1020,9 +1025,30 @@ function renderAdvertenciaCobertura(data) {
 
   const texto = document.createElement("p");
   const etiqueta = document.createElement("strong");
+  etiqueta.className = "cobertura-warning-label";
   etiqueta.textContent = "Advertencia de cobertura. ";
   texto.appendChild(etiqueta);
-  texto.appendChild(document.createTextNode(data.advertencia_cobertura));
+
+  // El texto en sí (data.advertencia_cobertura) es texto plano armado por
+  // el backend, sin markdown -- pero la frase que exige tratar los
+  // hallazgos como hipótesis es la instrucción central de la advertencia
+  // (adenda, sección 8.1) y debe resaltarse visualmente. Se busca y
+  // envuelve en <strong> solo al presentar, no se marca en el dato.
+  const FRASE_A_RESALTAR = "los hallazgos de este reporte deben tratarse solo como hipótesis por contrastar";
+  const cuerpo = data.advertencia_cobertura;
+  const inicioFrase = cuerpo.indexOf(FRASE_A_RESALTAR);
+
+  if (inicioFrase === -1) {
+    texto.appendChild(document.createTextNode(cuerpo));
+  } else {
+    const finFrase = inicioFrase + FRASE_A_RESALTAR.length;
+    texto.appendChild(document.createTextNode(cuerpo.slice(0, inicioFrase)));
+    const destacado = document.createElement("strong");
+    destacado.className = "cobertura-warning-highlight";
+    destacado.textContent = cuerpo.slice(inicioFrase, finFrase);
+    texto.appendChild(destacado);
+    texto.appendChild(document.createTextNode(cuerpo.slice(finFrase)));
+  }
 
   div.append(icono, texto);
   return div;
