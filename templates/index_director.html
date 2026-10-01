@@ -230,6 +230,29 @@
       background: rgba(var(--status-critical-rgb), 0.10);
     }
 
+    /* Advertencia obligatoria de cobertura (Adenda Técnica
+     * F4-ADENDA-EMISION-RI-EBRJEC26, sección 8.1) -- se ubica al inicio
+     * del reporte, antes del Panorama general, destacada visualmente.
+     * No puede omitirse ni trasladarse solo a la sección de cobertura. */
+    .cobertura-warning-banner {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      border-radius: 10px;
+      padding: 14px 16px;
+      margin-bottom: 18px;
+      border: 1px solid var(--status-warning);
+      background: rgba(var(--status-warning-rgb), 0.12);
+    }
+    .cobertura-warning-icon { font-size: 1.1rem; flex-shrink: 0; line-height: 1.4; }
+    .cobertura-warning-banner p {
+      margin: 0;
+      font-size: 0.88rem;
+      line-height: 1.55;
+      color: var(--text-primary);
+    }
+    .cobertura-warning-banner p strong { color: var(--status-warning); }
+
     .loading {
       color: var(--text-secondary);
       padding: 24px 0;
@@ -628,11 +651,6 @@ const CTX = {
   cmid: params.get("cmid"),
 };
 
-// Debe coincidir con core.UMBRAL_COBERTURA_MINIMA_PCT del backend. Solo
-// se usa para el texto de progreso; la decisión real siempre la toma el
-// backend (accion="esperar_docentes" / 409).
-const UMBRAL_COBERTURA_MINIMA_PCT = 35;
-
 /* ---------------------------------------------------------------------
  * DOM references
  * ------------------------------------------------------------------- */
@@ -721,25 +739,41 @@ function showOnly(...visibleIds) {
 /* Muestra el estado "aún no hay suficientes sesiones V1 válidas" — el
  * backend nunca llama al LLM en este caso (ni /consultar ni un intento de
  * /generar que reciba 409), así que no hay botón de reintento: el reporte
- * aparecerá solo cuando se alcance el mínimo. */
+ * aparecerá solo cuando se alcance el mínimo.
+ *
+ * Con la adenda, accion="esperar_docentes" ahora solo ocurre en
+ * COB_CONFIDENCIAL: menos de 5 evidencias válidas, o menos de 5
+ * docentes en la IE (banda "B0") -- el piso de 5 protege la
+ * confidencialidad de los resultados (ver core._debe_esperar_mas_docentes).
+ * A partir de 5, el reporte YA se genera (con advertencia si no llega
+ * al umbral de su banda), así que el mensaje no debe dar a entender que
+ * hay que esperar hasta umbral_requerido -- ese número es el que hace
+ * al reporte representativo, no el que habilita su generación. */
 function showEsperandoDocentes(info) {
   const n = info?.n_docentes_evaluados ?? 0;
   const nTotal = info?.n_docentes_total;
   const pct = info?.pct_cobertura_actual;
+  const umbralRequerido = info?.umbral_requerido;
   el.contextName.textContent = "Esperando Sesiones de aprendizaje V1…";
   el.btnRefresh.hidden = true;
 
-  // La decisión real (ver _debe_esperar_mas_docentes en el backend)
-  // combina un piso absoluto de docentes con el % de cobertura, pero acá
-  // solo se comunica la cobertura -- es el dato relevante para el
-  // directivo. Si por algún motivo no llega n_docentes_total/pct, se cae
-  // a un mensaje simple con el conteo de docentes evaluados.
-  el.esperandoDocentesText.textContent = (nTotal && pct !== undefined)
-    ? `Aún no se alcanza la cobertura mínima para generar el reporte institucional: se requiere el ` +
-      `${UMBRAL_COBERTURA_MINIMA_PCT}% de cobertura. Cobertura actual: ${pct}% (${n} de ${nTotal} docentes). ` +
-      "El reporte se generará automáticamente en cuanto se alcance el mínimo."
-    : `Aún no se alcanza la cobertura mínima para generar el reporte institucional (${n} docentes ` +
-      "evaluados hasta el momento). El reporte se generará automáticamente en cuanto se alcance el mínimo.";
+  let mensaje;
+  if (nTotal && umbralRequerido == null) {
+    // Banda B0: IE con menos de 5 docentes en total, sin umbral numérico.
+    mensaje = `Su institución tiene ${nTotal} docentes participantes. El reporte se generará cuando ` +
+      `se haya evaluado a todos (${n} de ${nTotal} hasta el momento).`;
+  } else if (nTotal && pct !== undefined && umbralRequerido != null) {
+    const faltanParaElMinimo = Math.max(5 - n, 0);
+    mensaje = `Su institución cuenta con ${n} de las 5 sesiones mínimas para generar el reporte ` +
+      `(${nTotal} docentes participantes${faltanParaElMinimo > 0 ? `; faltan ${faltanParaElMinimo}` : ""}). ` +
+      "En cuanto se alcancen esas 5 sesiones, el reporte se generará automáticamente. Sin embargo, " +
+      "con tan pocas sesiones revisadas, el reporte todavía no reflejará bien a toda la institución " +
+      `-- para eso se necesitan al menos ${umbralRequerido} sesiones válidas.`;
+  } else {
+    mensaje = `Aún no se alcanza el mínimo de 5 sesiones válidas para generar el reporte institucional ` +
+      `(${n} hasta el momento). El reporte se generará automáticamente en cuanto se alcance el mínimo.`;
+  }
+  el.esperandoDocentesText.textContent = mensaje;
   showOnly("esperando-docentes");
 }
 
@@ -966,12 +1000,43 @@ function emptyNote(container, texto) {
   container.appendChild(p);
 }
 
+/* Advertencia obligatoria de cobertura (COB_BAJO_UMBRAL, adenda RE-04 /
+ * sección 8.1). Retorna null si no aplica -- el llamador la omite del
+ * reporte en ese caso. Cuando aplica, no se omite ni se oculta: siempre
+ * va al inicio del reporte, antes de "1. Panorama general". El texto ya
+ * viene armado por el backend (Python, con las cifras exactas) -- el
+ * frontend solo lo presenta destacado. */
+function renderAdvertenciaCobertura(data) {
+  if (!data.advertencia_cobertura) return null;
+
+  const div = document.createElement("div");
+  div.className = "cobertura-warning-banner";
+  div.setAttribute("role", "alert");
+
+  const icono = document.createElement("span");
+  icono.className = "cobertura-warning-icon";
+  icono.setAttribute("aria-hidden", "true");
+  icono.textContent = "⚠️";
+
+  const texto = document.createElement("p");
+  const etiqueta = document.createElement("strong");
+  etiqueta.textContent = "Advertencia de cobertura. ";
+  texto.appendChild(etiqueta);
+  texto.appendChild(document.createTextNode(data.advertencia_cobertura));
+
+  div.append(icono, texto);
+  return div;
+}
+
 function render(data) {
   lastRenderedData = data;
   el.contextName.textContent = data.nombre_ie || "—";
 
+  const advertencia = renderAdvertenciaCobertura(data);
+
   el.reporteContainer.replaceChildren(
     renderEncabezado(data),
+    ...(advertencia ? [advertencia] : []),
     renderPanoramaGeneral(data),
     renderResultadoGeneral(data),
     renderInterpretacion(data),

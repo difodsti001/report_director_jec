@@ -285,30 +285,95 @@ def test_cp11_determinismo():
     assert core.calcular_distribucion_por_criterio(filas) == core.calcular_distribucion_por_criterio(filas)
 
 
-def test_debe_esperar_mas_docentes_ie_grande_bajo_piso_absoluto():
-    """IE grande (200 docentes), solo 4 evaluados -> por debajo del piso
-    absoluto (5) Y del 35% -> debe esperar."""
-    assert core._debe_esperar_mas_docentes(n_actual=4, pct_cobertura_actual=2) is True
+def test_debe_esperar_mas_docentes_bajo_5_evidencias():
+    """N=96 (banda B5), solo 4 evidencias válidas -> COB_CONFIDENCIAL
+    (menos de 5 evidencias) -> debe esperar."""
+    assert core._debe_esperar_mas_docentes(n_actual=4, n_total=96) is True
 
 
-def test_debe_esperar_mas_docentes_ie_grande_sobre_piso_bajo_cobertura():
-    """IE grande (200 docentes), 5 evaluados (piso absoluto cumplido) pero
-    solo 3% de cobertura -> igual debe esperar: el piso absoluto solo no
-    basta para una IE grande."""
-    assert core._debe_esperar_mas_docentes(n_actual=5, pct_cobertura_actual=3) is True
+def test_debe_esperar_mas_docentes_bajo_umbral_ya_no_espera():
+    """RE-04 de la Adenda: N=96, 5 evidencias válidas -> COB_BAJO_UMBRAL
+    (no COB_CONFIDENCIAL) -> ya NO debe esperar, se emite con
+    advertencia."""
+    assert core._debe_esperar_mas_docentes(n_actual=5, n_total=96) is False
 
 
-def test_debe_esperar_mas_docentes_ie_mediana_cumple_ambos_umbrales():
-    """IE mediana (14 docentes), 5 evaluados -> 36% de cobertura, cumple
-    ambos umbrales -> ya no debe esperar."""
-    assert core._debe_esperar_mas_docentes(n_actual=5, pct_cobertura_actual=36) is False
+def test_debe_esperar_mas_docentes_cob_suficiente_no_espera():
+    """N=40, 28 evidencias válidas -> COB_SUFICIENTE -> no debe esperar."""
+    assert core._debe_esperar_mas_docentes(n_actual=28, n_total=40) is False
 
 
-def test_debe_esperar_mas_docentes_ie_pequena_escape_100_por_ciento():
-    """IE muy pequeña (3 docentes en total): nunca alcanzaría ni el piso
-    absoluto (5) ni el 35% de forma normal, pero si ya se evaluó al 100%
-    de la plana docente, se genera igual (escape)."""
-    assert core._debe_esperar_mas_docentes(n_actual=3, pct_cobertura_actual=100) is False
+def test_debe_esperar_mas_docentes_banda_b0_escape_100_por_ciento():
+    """IE muy pequeña (N=3, banda B0): nunca deja de ser COB_CONFIDENCIAL
+    por más evidencias que junte (RE-05) -- pero si ya se evaluó al 100%
+    de la plana docente, se genera igual (escape, mismo comportamiento
+    que antes de la Adenda para IEs muy pequeñas)."""
+    assert core._debe_esperar_mas_docentes(n_actual=2, n_total=3) is True
+    assert core._debe_esperar_mas_docentes(n_actual=3, n_total=3) is False
+
+
+def test_adenda_cp13_banda_b5_bajo_umbral():
+    """CP13 (Adenda §14): N=96, 5 V1 válidas -> banda B5, umbral 58,
+    COB_BAJO_UMBRAL."""
+    resultado = core._clasificar_cobertura(n_evidencias_validas=5, n_docentes_total=96)
+    assert resultado == {"banda_aplicada": "B5", "umbral_requerido": 58, "estado_cobertura": "COB_BAJO_UMBRAL"}
+
+
+def test_adenda_cp14_banda_b3_suficiente():
+    """CP14 (Adenda §14): N=40, 28 V1 válidas -> banda B3, umbral 28,
+    COB_SUFICIENTE (justo en el umbral)."""
+    resultado = core._clasificar_cobertura(n_evidencias_validas=28, n_docentes_total=40)
+    assert resultado == {"banda_aplicada": "B3", "umbral_requerido": 28, "estado_cobertura": "COB_SUFICIENTE"}
+
+
+def test_adenda_cp15_banda_b3_bajo_umbral_por_una_evidencia():
+    """CP15 (Adenda §14): N=40, 27 V1 válidas (una menos que CP14) ->
+    COB_BAJO_UMBRAL."""
+    resultado = core._clasificar_cobertura(n_evidencias_validas=27, n_docentes_total=40)
+    assert resultado["banda_aplicada"] == "B3"
+    assert resultado["umbral_requerido"] == 28
+    assert resultado["estado_cobertura"] == "COB_BAJO_UMBRAL"
+
+
+def test_adenda_cp16_banda_b1_redondeo_hacia_arriba():
+    """CP16 (Adenda §14): N=12, 10 V1 válidas -> banda B1, umbral
+    ⌈0,85×12⌉=⌈10,2⌉=11 (redondeo siempre hacia arriba, RE-02) ->
+    COB_BAJO_UMBRAL."""
+    resultado = core._clasificar_cobertura(n_evidencias_validas=10, n_docentes_total=12)
+    assert resultado == {"banda_aplicada": "B1", "umbral_requerido": 11, "estado_cobertura": "COB_BAJO_UMBRAL"}
+
+
+def test_adenda_cp17_confidencial_por_menos_de_5_validas():
+    """CP17 (Adenda §14): N=30, solo 4 V1 válidas -> COB_CONFIDENCIAL
+    (RE-05), sin importar que N esté en banda B2."""
+    resultado = core._clasificar_cobertura(n_evidencias_validas=4, n_docentes_total=30)
+    assert resultado["estado_cobertura"] == "COB_CONFIDENCIAL"
+
+
+def test_adenda_cp18_banda_b0_confidencial_aunque_cobertura_100():
+    """CP18 (Adenda §14): N=4, 4 V1 válidas (100% de cobertura) -> banda
+    B0, COB_CONFIDENCIAL de todas formas -- el umbral nunca aplica para
+    N<5 (RE-05)."""
+    resultado = core._clasificar_cobertura(n_evidencias_validas=4, n_docentes_total=4)
+    assert resultado == {"banda_aplicada": "B0", "umbral_requerido": None, "estado_cobertura": "COB_CONFIDENCIAL"}
+
+
+def test_construir_advertencia_cobertura_texto_exacto_de_la_adenda():
+    """El texto debe coincidir con la Adenda Técnica, sección 8.1,
+    variante RI 1 -- armado en Python, el LLM nunca lo toca."""
+    texto = core._construir_advertencia_cobertura(
+        n_evidencias_validas=5, umbral_requerido=58, n_docentes_total=96, pct_cobertura=5
+    )
+    assert texto == (
+        "Este reporte se elaboró con 5 de las 58 sesiones "
+        "válidas requeridas para representar a su institución (5 de "
+        "96 docentes participantes; 5%). Los resultados describen "
+        "únicamente las sesiones revisadas y no pueden generalizarse al conjunto de docentes. Por "
+        "ello, los hallazgos de este reporte deben tratarse solo como hipótesis por contrastar con "
+        "otras fuentes de su institución —MPE, ENLA, evidencias de aprendizaje de los estudiantes, "
+        "registros de monitoreo y acompañamiento— antes de utilizarse en el Diagnóstico "
+        "institucional y en la RTC 1."
+    )
 
 
 def test_cp13_umbral_30_incluye_solo_una_fila():
