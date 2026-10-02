@@ -11,6 +11,24 @@ import pytest
 import core
 
 
+def test_armar_clave_ie_incluye_ugel():
+    """La clave compuesta debe incluir ugel -- nombre_ie no es único a
+    nivel nacional: dos IEs de distinta UGEL pueden compartir nombre,
+    región y distrito, y sin ugel se mezclarían en la misma fila de
+    caché."""
+    clave = core._armar_clave_ie("SAN MARTIN", "UGEL CAJABAMBA", "CAJAMARCA", "CAJABAMBA")
+    assert clave == "SAN MARTIN|UGEL CAJABAMBA|CAJAMARCA|CAJABAMBA"
+
+    clave_otra_ugel = core._armar_clave_ie("SAN MARTIN", "UGEL CONTUMAZA", "CAJAMARCA", "CAJABAMBA")
+    assert clave != clave_otra_ugel
+
+
+def test_armar_clave_ie_tolera_valores_none():
+    """ugel y distrito pueden venir NULL de la base -- no debe romper."""
+    clave = core._armar_clave_ie("SAN MARTIN", None, "CAJAMARCA", None)
+    assert clave == "SAN MARTIN||CAJAMARCA|"
+
+
 def _fila(user_id, criterion_index, nivel, status="success", nivel_educativo="Primaria", brecha=None, tipo_brecha=None):
     return {
         "user_id": user_id,
