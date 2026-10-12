@@ -146,11 +146,15 @@ async def cerrar_pools() -> None:
 
 
 async def _asegurar_schema_cache() -> None:
-    """Crea las tablas de caché si no existen."""
+    """Crea las tablas de caché si no existen -- solo aplica en una base
+    nueva (CREATE TABLE IF NOT EXISTS no altera una tabla que ya existe,
+    así que si tipo_reporte se agregó a mano a una base ya creada, este
+    DDL no la toca; ver TIPO_REPORTE)."""
     ddl = """
         CREATE TABLE IF NOT EXISTS f4_reportes_directivo (
             id SERIAL PRIMARY KEY,
-            cod_modular VARCHAR NOT NULL UNIQUE,
+            cod_modular VARCHAR NOT NULL,
+            tipo_reporte VARCHAR NOT NULL DEFAULT 'RI1',
             estado VARCHAR NOT NULL DEFAULT 'generado',
             n_docentes_evaluados INTEGER NOT NULL,
             reporte_json JSONB,
@@ -158,18 +162,20 @@ async def _asegurar_schema_cache() -> None:
             fecha_actualizacion TIMESTAMP NOT NULL DEFAULT now(),
             CONSTRAINT chk_estado CHECK (estado IN ('generado', 'muestra_insuficiente', 'sin_datos')),
             CONSTRAINT chk_reporte_json_si_generado
-                CHECK (estado <> 'generado' OR reporte_json IS NOT NULL)
+                CHECK (estado <> 'generado' OR reporte_json IS NOT NULL),
+            CONSTRAINT uq_cod_modular_tipo_reporte UNIQUE (cod_modular, tipo_reporte)
         );
 
         CREATE TABLE IF NOT EXISTS f4_consultas_directivo (
             id SERIAL PRIMARY KEY,
             cod_modular VARCHAR NOT NULL,
+            tipo_reporte VARCHAR NOT NULL DEFAULT 'RI1',
             userid_directivo INTEGER NOT NULL,
             courseid INTEGER NOT NULL,
             cmid INTEGER NOT NULL,
             id_reporte_directivo INTEGER NOT NULL REFERENCES f4_reportes_directivo(id),
             fecha_consulta TIMESTAMP NOT NULL DEFAULT now(),
-            CONSTRAINT uq_cod_modular_userid UNIQUE (cod_modular, userid_directivo)
+            CONSTRAINT uq_cod_modular_userid_tipo UNIQUE (cod_modular, userid_directivo, tipo_reporte)
         );
 
         CREATE INDEX IF NOT EXISTS idx_consultas_cod_modular ON f4_consultas_directivo (cod_modular);
@@ -184,6 +190,16 @@ async def _asegurar_schema_cache() -> None:
 # =============================================================================
 # Configuración de negocio
 # =============================================================================
+
+# f4_reportes_directivo y f4_consultas_directivo son tablas compartidas
+# por toda la familia F4 (RI1, RI2, RI3 -- EBR y JEC), identificadas por
+# la columna "tipo_reporte". Este servicio es exclusivamente RI1, así
+# que toda lectura/escritura sobre esas dos tablas debe filtrar o fijar
+# este valor -- de lo contrario, una fila de otro tipo de reporte para
+# la misma IE (mismo cod_modular) podría leerse o sobrescribirse como si
+# fuera la de este servicio.
+TIPO_REPORTE = "RI1"
+
 COLUMNAS_FILTRO_IE = ("nombre_ie", "ugel", '"región"', "distrito")
 _SEPARADOR_CLAVE_IE = "|"
 
@@ -1634,17 +1650,22 @@ async def generar_reporte(cod_modular: str, nombre_ie: str, ugel: str, region: s
 # =============================================================================
 
 async def obtener_reporte_guardado(cod_modular: str) -> Optional[dict]:
-    """Trae la fila de f4_reportes_directivo para esta IE, sin importar el
-    estado (generado, muestra_insuficiente, sin_datos) -- o None si esta
-    IE nunca tuvo ni un intento de generación."""
+    """Trae la fila de f4_reportes_directivo para esta IE Y para
+    tipo_reporte=RI1 (ver TIPO_REPORTE -- la tabla es compartida con
+    otros reportes de la familia F4, EBR y JEC), sin importar el estado
+    (generado, muestra_insuficiente, sin_datos) -- o None si esta IE
+    nunca tuvo ni un intento de generación de ESTE reporte."""
     query = """
         SELECT id, cod_modular, estado, n_docentes_evaluados, reporte_json,
                fecha_generacion, fecha_actualizacion
         FROM f4_reportes_directivo
         WHERE cod_modular = %(cod_modular)s
+          AND tipo_reporte = %(tipo_reporte)s
     """
     async with pool_cache.connection() as conn:
-        return await (await conn.execute(query, {"cod_modular": cod_modular})).fetchone()
+        return await (await conn.execute(
+            query, {"cod_modular": cod_modular, "tipo_reporte": TIPO_REPORTE}
+        )).fetchone()
 
 
 async def guardar_estado_reporte(
@@ -1658,15 +1679,19 @@ async def guardar_estado_reporte(
     de 'generado', 'muestra_insuficiente', 'sin_datos'. reporte_json
     solo se pasa (y solo debe pasarse) cuando estado='generado'.
 
-    Como hay una sola fila por cod_modular, esto cubre tanto el primer
-    intento (exitoso o no) como los siguientes -- INSERT si es la
-    primera vez que se toca esta IE, UPDATE si ya existía una fila
-    (sin importar cuál era su estado anterior).
+    Como hay una sola fila por (cod_modular, tipo_reporte) --
+    CONSTRAINT uq_cod_modular_tipo_reporte UNIQUE (cod_modular,
+    tipo_reporte) -- esto cubre tanto el primer intento (exitoso o no)
+    como los siguientes -- INSERT si es la primera vez que se toca esta
+    IE para este tipo de reporte, UPDATE si ya existía una fila (sin
+    importar cuál era su estado anterior). La tabla es compartida con
+    otros reportes de la familia F4 (ej. RI2), así que tipo_reporte
+    evita que se pisen entre sí para la misma IE.
     """
     query = """
-        INSERT INTO f4_reportes_directivo (cod_modular, estado, n_docentes_evaluados, reporte_json)
-        VALUES (%(cod_modular)s, %(estado)s, %(n)s, %(reporte)s)
-        ON CONFLICT (cod_modular) DO UPDATE SET
+        INSERT INTO f4_reportes_directivo (cod_modular, tipo_reporte, estado, n_docentes_evaluados, reporte_json)
+        VALUES (%(cod_modular)s, %(tipo_reporte)s, %(estado)s, %(n)s, %(reporte)s)
+        ON CONFLICT (cod_modular, tipo_reporte) DO UPDATE SET
             estado = EXCLUDED.estado,
             n_docentes_evaluados = EXCLUDED.n_docentes_evaluados,
             reporte_json = COALESCE(EXCLUDED.reporte_json, f4_reportes_directivo.reporte_json),
@@ -1676,6 +1701,7 @@ async def guardar_estado_reporte(
     async with pool_cache.connection() as conn:
         row = await (await conn.execute(query, {
             "cod_modular": cod_modular,
+            "tipo_reporte": TIPO_REPORTE,
             "estado": estado,
             "n": n_docentes_evaluados,
             "reporte": Jsonb(reporte_json) if reporte_json is not None else None,
@@ -1688,17 +1714,20 @@ async def guardar_estado_reporte(
 async def registrar_consulta(
     cod_modular: str, userid_directivo: int, courseid: int, cmid: int, id_reporte_directivo: int
 ) -> None:
-    """Asocia un directivo con el reporte de su IE. Un registro único por
-    (cod_modular, userid_directivo) -- cada llamada (upsert) actualiza
-    fecha_consulta a la fecha/hora actual, para que la columna refleje la
-    ÚLTIMA vez que este directivo pasó por POST /reporte/generar, no solo
-    la primera (antes usaba DO NOTHING, que dejaba la fecha congelada en
-    el primer registro)."""
+    """Asocia un directivo con el reporte de su IE para tipo_reporte=RI1.
+    Un registro único por (cod_modular, userid_directivo, tipo_reporte)
+    -- CONSTRAINT uq_cod_modular_userid_tipo -- cada llamada (upsert)
+    actualiza fecha_consulta a la fecha/hora actual, para que la columna
+    refleje la ÚLTIMA vez que este directivo pasó por POST
+    /reporte/generar, no solo la primera (antes usaba DO NOTHING, que
+    dejaba la fecha congelada en el primer registro). tipo_reporte evita
+    que la asociación de un directivo a RI1 se mezcle con su asociación
+    a otro reporte (ej. RI2) para la misma IE."""
     query = """
         INSERT INTO f4_consultas_directivo
-            (cod_modular, userid_directivo, courseid, cmid, id_reporte_directivo)
-        VALUES (%(cod_modular)s, %(userid)s, %(courseid)s, %(cmid)s, %(id_reporte)s)
-        ON CONFLICT (cod_modular, userid_directivo) DO UPDATE SET
+            (cod_modular, tipo_reporte, userid_directivo, courseid, cmid, id_reporte_directivo)
+        VALUES (%(cod_modular)s, %(tipo_reporte)s, %(userid)s, %(courseid)s, %(cmid)s, %(id_reporte)s)
+        ON CONFLICT (cod_modular, userid_directivo, tipo_reporte) DO UPDATE SET
             courseid = EXCLUDED.courseid,
             cmid = EXCLUDED.cmid,
             id_reporte_directivo = EXCLUDED.id_reporte_directivo,
@@ -1707,6 +1736,7 @@ async def registrar_consulta(
     async with pool_cache.connection() as conn:
         await conn.execute(query, {
             "cod_modular": cod_modular,
+            "tipo_reporte": TIPO_REPORTE,
             "userid": userid_directivo,
             "courseid": courseid,
             "cmid": cmid,
