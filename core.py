@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -145,11 +146,15 @@ async def cerrar_pools() -> None:
 
 
 async def _asegurar_schema_cache() -> None:
-    """Crea las tablas de caché si no existen."""
+    """Crea las tablas de caché si no existen -- solo aplica en una base
+    nueva (CREATE TABLE IF NOT EXISTS no altera una tabla que ya existe,
+    así que si tipo_reporte se agregó a mano a una base ya creada, este
+    DDL no la toca; ver TIPO_REPORTE)."""
     ddl = """
         CREATE TABLE IF NOT EXISTS f4_reportes_directivo (
             id SERIAL PRIMARY KEY,
-            cod_modular VARCHAR NOT NULL UNIQUE,
+            cod_modular VARCHAR NOT NULL,
+            tipo_reporte VARCHAR NOT NULL DEFAULT 'RI1',
             estado VARCHAR NOT NULL DEFAULT 'generado',
             n_docentes_evaluados INTEGER NOT NULL,
             reporte_json JSONB,
@@ -157,18 +162,20 @@ async def _asegurar_schema_cache() -> None:
             fecha_actualizacion TIMESTAMP NOT NULL DEFAULT now(),
             CONSTRAINT chk_estado CHECK (estado IN ('generado', 'muestra_insuficiente', 'sin_datos')),
             CONSTRAINT chk_reporte_json_si_generado
-                CHECK (estado <> 'generado' OR reporte_json IS NOT NULL)
+                CHECK (estado <> 'generado' OR reporte_json IS NOT NULL),
+            CONSTRAINT uq_cod_modular_tipo_reporte UNIQUE (cod_modular, tipo_reporte)
         );
 
         CREATE TABLE IF NOT EXISTS f4_consultas_directivo (
             id SERIAL PRIMARY KEY,
             cod_modular VARCHAR NOT NULL,
+            tipo_reporte VARCHAR NOT NULL DEFAULT 'RI1',
             userid_directivo INTEGER NOT NULL,
             courseid INTEGER NOT NULL,
             cmid INTEGER NOT NULL,
             id_reporte_directivo INTEGER NOT NULL REFERENCES f4_reportes_directivo(id),
             fecha_consulta TIMESTAMP NOT NULL DEFAULT now(),
-            CONSTRAINT uq_cod_modular_userid UNIQUE (cod_modular, userid_directivo)
+            CONSTRAINT uq_cod_modular_userid_tipo UNIQUE (cod_modular, userid_directivo, tipo_reporte)
         );
 
         CREATE INDEX IF NOT EXISTS idx_consultas_cod_modular ON f4_consultas_directivo (cod_modular);
@@ -183,14 +190,26 @@ async def _asegurar_schema_cache() -> None:
 # =============================================================================
 # Configuración de negocio
 # =============================================================================
-COLUMNAS_FILTRO_IE = ("nombre_ie", '"región"', "distrito")
+
+# f4_reportes_directivo y f4_consultas_directivo son tablas compartidas
+# por toda la familia F4 (RI1, RI2, RI3 -- EBR y JEC), identificadas por
+# la columna "tipo_reporte". Este servicio es exclusivamente RI1, así
+# que toda lectura/escritura sobre esas dos tablas debe filtrar o fijar
+# este valor -- de lo contrario, una fila de otro tipo de reporte para
+# la misma IE (mismo cod_modular) podría leerse o sobrescribirse como si
+# fuera la de este servicio.
+TIPO_REPORTE = "RI1"
+
+COLUMNAS_FILTRO_IE = ("nombre_ie", "ugel", '"región"', "distrito")
 _SEPARADOR_CLAVE_IE = "|"
 
 
-def _armar_clave_ie(nombre_ie: str, region: str, distrito: str) -> str:
+def _armar_clave_ie(nombre_ie: str, ugel: str, region: str, distrito: str) -> str:
     """Arma la clave compuesta que identifica una IE en el caché, a
-    partir de los 3 valores ya resueltos desde la consulta SQL."""
-    return _SEPARADOR_CLAVE_IE.join([nombre_ie or "", region or "", distrito or ""])
+    partir de los 4 valores ya resueltos desde la consulta SQL. Se
+    agrega "ugel" porque nombre_ie no es único a nivel nacional -- dos
+    IEs de distinta UGEL pueden compartir nombre, región y distrito."""
+    return _SEPARADOR_CLAVE_IE.join([nombre_ie or "", ugel or "", region or "", distrito or ""])
 
 
 def _normalizar_cod_institucional(cod_institucional) -> Optional[str]:
@@ -203,19 +222,19 @@ def _normalizar_cod_institucional(cod_institucional) -> Optional[str]:
 
 
 def _filtro_ie(
-    cod_institucional: Optional[str], nombre_ie: str, region: str, distrito: str
+    cod_institucional: Optional[str], nombre_ie: str, ugel: str, region: str, distrito: str
 ) -> tuple[str, dict]:
     """Fragmento SQL (sin 'WHERE'/'AND') + parámetros que identifican a la
     IE. Primera opción: cod_institucional. Fallback, solo si no hay
-    cod_institucional: las 3 columnas (nombre_ie, región, distrito) por
-    separado, no concatenadas, para que Postgres pueda usar índices."""
+    cod_institucional: las 4 columnas (nombre_ie, ugel, región, distrito)
+    por separado, no concatenadas, para que Postgres pueda usar índices."""
     cod = _normalizar_cod_institucional(cod_institucional)
     if cod is not None:
         return "cod_institucional = %(cod_institucional)s", {"cod_institucional": cod}
     return (
-        'nombre_ie = %(nombre_ie)s AND "región" = %(region)s '
-        "AND distrito IS NOT DISTINCT FROM %(distrito)s",
-        {"nombre_ie": nombre_ie, "region": region, "distrito": distrito},
+        'nombre_ie = %(nombre_ie)s AND ugel IS NOT DISTINCT FROM %(ugel)s '
+        'AND "región" = %(region)s AND distrito IS NOT DISTINCT FROM %(distrito)s',
+        {"nombre_ie": nombre_ie, "ugel": ugel, "region": region, "distrito": distrito},
     )
 
 
@@ -344,12 +363,23 @@ UMBRAL_MUESTRA_INSUFICIENTE = 5
 # este %. No es un umbral de prioridad -- por debajo de él, la necesidad
 # puede existir en la distribución pero no aparece en esa tabla.
 UMBRAL_NECESIDAD_FRECUENTE_PCT = 30
-# Cobertura mínima (sobre el total de docentes de la IE) para generar el
-# reporte sin esperar más evaluaciones -- ver _debe_esperar_mas_docentes.
-# Complementa a UMBRAL_MUESTRA_INSUFICIENTE: ese piso absoluto (5) por sí
-# solo es insuficiente en IEs grandes (5 de 100 docentes es 5% de
-# cobertura, poco representativo institucionalmente).
-UMBRAL_COBERTURA_MINIMA_PCT = 35
+
+# Bandas de umbral de cobertura -- Adenda Técnica
+# F4-ADENDA-EMISION-RI-EBRJEC26 v1.0, sección 4 (aplica a EBR y JEC por
+# igual, sección 2: "para JEC aplica la misma regla de emisión, sin
+# redefinirla"). Reemplaza el umbral fijo plano que se usaba antes
+# (UMBRAL_COBERTURA_MINIMA_PCT=35): el % de cobertura exigido baja a
+# medida que crece la IE, para que el umbral absoluto de evidencias siga
+# siendo alcanzable sin pedir una cobertura irrealmente alta en IEs
+# grandes. Tupla: (N mínimo, N máximo o None, banda, % de cobertura
+# exigido). Ver _clasificar_cobertura.
+BANDAS_COBERTURA = (
+    (5, 20, "B1", 85),
+    (21, 35, "B2", 80),
+    (36, 50, "B3", 70),
+    (51, 70, "B4", 65),
+    (71, None, "B5", 60),
+)
 
 # Cursos y cmids de docentes
 CMIDS_DOCENTES_POR_CURSO: dict[int, list[int] | None] = {
@@ -398,15 +428,15 @@ async def resolver_cod_modular(userid: int) -> dict:
     """
     Busca la IE del directivo por userid. Retorna
     {"cod_modular": <clave>, "cod_institucional": ... | None,
-    "nombre_ie": ..., "region": ..., "distrito": ...}.
+    "nombre_ie": ..., "ugel": ..., "region": ..., "distrito": ...}.
 
     La clave ("cod_modular", nombre mantenido por compatibilidad con el
     caché, logs y registrar_consulta) es el cod_institucional si existe;
     si es null/vacío, cae a la clave compuesta armada con
-    _armar_clave_ie (nombre_ie|región|distrito).
+    _armar_clave_ie (nombre_ie|ugel|región|distrito).
     """
     query = """
-        SELECT cod_institucional, nombre_ie, "región" AS region, distrito
+        SELECT cod_institucional, nombre_ie, ugel, "región" AS region, distrito
         FROM public."base_ebr_IA"
         WHERE userid = %(userid)s
         LIMIT 1
@@ -422,7 +452,7 @@ async def resolver_cod_modular(userid: int) -> dict:
     if cod_institucional is not None:
         clave_ie = cod_institucional
     else:
-        clave_ie = _armar_clave_ie(row["nombre_ie"], row["region"], row["distrito"])
+        clave_ie = _armar_clave_ie(row["nombre_ie"], row["ugel"], row["region"], row["distrito"])
 
     log.info(
         "cod_modular_resuelto",
@@ -431,6 +461,7 @@ async def resolver_cod_modular(userid: int) -> dict:
         cod_institucional=cod_institucional,
         usa_fallback_clave_compuesta=cod_institucional is None,
         nombre_ie=row["nombre_ie"],
+        ugel=row["ugel"],
         region=row["region"],
         distrito=row["distrito"],
     )
@@ -438,21 +469,22 @@ async def resolver_cod_modular(userid: int) -> dict:
         "cod_modular": clave_ie,
         "cod_institucional": cod_institucional,
         "nombre_ie": row["nombre_ie"],
+        "ugel": row["ugel"],
         "region": row["region"],
         "distrito": row["distrito"],
     }
 
 
 async def contar_docentes_total(
-    nombre_ie: str, region: str, distrito: str, nivel_educativo: Optional[str] = None,
+    nombre_ie: str, ugel: str, region: str, distrito: str, nivel_educativo: Optional[str] = None,
     cod_institucional: Optional[str] = None,
 ) -> int:
     """Cuenta docentes+jerárquicos en base_ebr_IA para esta IE. Filtra por
-    cod_institucional si existe; si es null/vacío, por las 3 columnas
-    (nombre_ie, región, distrito) -- ver _filtro_ie. Si se pasa
+    cod_institucional si existe; si es null/vacío, por las 4 columnas
+    (nombre_ie, ugel, región, distrito) -- ver _filtro_ie. Si se pasa
     nivel_educativo, filtra además por ese nivel (Secundaria/Primaria/
     Inicial); si es None, cuenta los 3 niveles juntos."""
-    filtro_ie, params_ie = _filtro_ie(cod_institucional, nombre_ie, region, distrito)
+    filtro_ie, params_ie = _filtro_ie(cod_institucional, nombre_ie, ugel, region, distrito)
     query = f"""
         SELECT COUNT(*) AS total
         FROM public."base_ebr_IA"
@@ -474,14 +506,14 @@ async def contar_docentes_total(
 
 
 async def obtener_filas_vista(
-    nombre_ie: str, region: str, distrito: str, nivel_educativo: Optional[str] = None,
+    nombre_ie: str, ugel: str, region: str, distrito: str, nivel_educativo: Optional[str] = None,
     cod_institucional: Optional[str] = None,
 ) -> list[dict]:
     """Trae todas las filas de la vista, sin filtrar por status -- incluye
     'success' (válida), 'validation_failed' (no válida) y 'failed' (sin
     evidencia real, se trata como sin entrega). El llamador filtra según lo
     que necesite (ver filas_validas / clasificar_evidencias_por_estado).
-    Filtra por cod_institucional, o por las 3 columnas si es null/vacío
+    Filtra por cod_institucional, o por las 4 columnas si es null/vacío
     (ver _filtro_ie). Si se pasa nivel_educativo, filtra además por ese
     nivel; si es None, trae los 3 niveles juntos."""
     cmids_validos = _cmids_docentes_configurados()
@@ -492,7 +524,7 @@ async def obtener_filas_vista(
             "Ningún curso de docentes tiene cmids válidos configurados todavía"
         )
 
-    filtro_ie, params_ie = _filtro_ie(cod_institucional, nombre_ie, region, distrito)
+    filtro_ie, params_ie = _filtro_ie(cod_institucional, nombre_ie, ugel, region, distrito)
     query = f"""
         SELECT user_id, criterion_index, nivel_obtenido, brecha, tipo_brecha, status,
                nivel_educativo, retroalimentacion
@@ -517,7 +549,7 @@ async def obtener_filas_vista(
     log.info(
         "filas_vista_obtenidas",
         cod_institucional=cod_institucional,
-        nombre_ie=nombre_ie, region=region, distrito=distrito,
+        nombre_ie=nombre_ie, ugel=ugel, region=region, distrito=distrito,
         nivel_educativo=nivel_educativo, n_filas=len(rows),
     )
     return rows
@@ -538,7 +570,7 @@ def _normalizar_nivel_obtenido(rows: list[dict]) -> None:
 
 
 async def contar_docentes_evaluados(
-    nombre_ie: str, region: str, distrito: str, nivel_educativo: Optional[str] = None,
+    nombre_ie: str, ugel: str, region: str, distrito: str, nivel_educativo: Optional[str] = None,
     cod_institucional: Optional[str] = None,
 ) -> int:
     """
@@ -562,7 +594,7 @@ async def contar_docentes_evaluados(
     if not cmids_validos:
         return 0
 
-    filtro_ie, params_ie = _filtro_ie(cod_institucional, nombre_ie, region, distrito)
+    filtro_ie, params_ie = _filtro_ie(cod_institucional, nombre_ie, ugel, region, distrito)
     query = f"""
         WITH filas AS (
             SELECT user_id, criterion_index, nivel_obtenido, nivel_educativo
@@ -818,6 +850,66 @@ def calcular_frecuencia_brechas(brechas_por_docente: dict[int, list[str]]) -> di
         brecha_id: {"conteo": conteo, "pct": round(100 * conteo / n_docentes)}
         for brecha_id, conteo in conteos.items()
     }
+
+
+def _clasificar_cobertura(n_evidencias_validas: int, n_docentes_total: int) -> dict:
+    """
+    Clasifica la cobertura del reporte según las bandas de la Adenda
+    Técnica F4-ADENDA-EMISION-RI-EBRJEC26 v1.0 (sección 4, RE-02 a RE-05).
+    Aplica a EBR y JEC por igual (sección 2 de la Adenda: "para JEC
+    aplica la misma regla de emisión, sin redefinirla").
+
+    Retorna {"banda_aplicada", "umbral_requerido", "estado_cobertura"}:
+      - Si n_docentes_total < 5 (banda "B0"): no aplica umbral --
+        umbral_requerido=None, estado_cobertura="COB_CONFIDENCIAL"
+        SIEMPRE, incluso con 100% de cobertura (RE-05, CP18): proteger
+        la confidencialidad de resultados individuales no depende de
+        qué tan completa esté la evaluación si la IE es muy pequeña.
+      - Si no: se ubica la banda según N (BANDAS_COBERTURA) y se calcula
+        umbral_requerido = máx(5, ⌈% de la banda × N⌉) -- redondeo
+        siempre hacia arriba (RE-02). Luego:
+          - n_evidencias_validas < 5                  -> COB_CONFIDENCIAL (RE-05)
+          - n_evidencias_validas < umbral_requerido    -> COB_BAJO_UMBRAL (RE-04)
+          - en otro caso                               -> COB_SUFICIENTE (RE-03)
+    """
+    if n_docentes_total < 5:
+        return {"banda_aplicada": "B0", "umbral_requerido": None, "estado_cobertura": "COB_CONFIDENCIAL"}
+
+    for n_min, n_max, banda, pct_banda in BANDAS_COBERTURA:
+        if n_docentes_total >= n_min and (n_max is None or n_docentes_total <= n_max):
+            umbral_requerido = max(5, math.ceil(pct_banda / 100 * n_docentes_total))
+            if n_evidencias_validas < 5:
+                estado_cobertura = "COB_CONFIDENCIAL"
+            elif n_evidencias_validas < umbral_requerido:
+                estado_cobertura = "COB_BAJO_UMBRAL"
+            else:
+                estado_cobertura = "COB_SUFICIENTE"
+            return {
+                "banda_aplicada": banda,
+                "umbral_requerido": umbral_requerido,
+                "estado_cobertura": estado_cobertura,
+            }
+
+    raise ValueError(f"n_docentes_total={n_docentes_total} no cayó en ninguna banda de BANDAS_COBERTURA")
+
+
+def _construir_advertencia_cobertura(
+    n_evidencias_validas: int, umbral_requerido: int, n_docentes_total: int, pct_cobertura: int
+) -> str:
+    """Texto EXACTO de la Adenda Técnica, sección 8.1, variante RI 1 --
+    armado en Python con las cifras ya calculadas (el LLM nunca lo
+    redacta ni lo toca). Se usa solo cuando estado_cobertura ==
+    'COB_BAJO_UMBRAL' (ver generar_reporte)."""
+    return (
+        f"Este reporte se elaboró con {n_evidencias_validas} de las {umbral_requerido} sesiones "
+        f"válidas requeridas para representar a su institución ({n_evidencias_validas} de "
+        f"{n_docentes_total} docentes participantes; {pct_cobertura}%). Los resultados describen "
+        "únicamente las sesiones revisadas y no pueden generalizarse al conjunto de docentes. Por "
+        "ello, los hallazgos de este reporte deben tratarse solo como hipótesis por contrastar con "
+        "otras fuentes de su institución —MPE, ENLA, evidencias de aprendizaje de los estudiantes, "
+        "registros de monitoreo y acompañamiento— antes de utilizarse en el Diagnóstico "
+        "institucional y en la RTC 1."
+    )
 
 
 def clasificar_fortalezas(distribucion: list[dict]) -> list[dict]:
@@ -1450,7 +1542,7 @@ def _sin_punto_final(texto: str) -> str:
 # =============================================================================
 
 async def generar_reporte(
-    cod_modular: str, nombre_ie: str, region: str, distrito: str,
+    cod_modular: str, nombre_ie: str, ugel: str, region: str, distrito: str,
     cod_institucional: Optional[str] = None,
 ) -> dict:
     """
@@ -1458,13 +1550,13 @@ async def generar_reporte(
     institucional para la IE completa.
 
     cod_modular es la clave de la IE (cod_institucional, o la clave
-    compuesta nombre_ie|región|distrito si no hay), usada como institución
-    y para logs/caché. Las queries reales contra base_ebr_IA y
-    vw_processing_brechas_jec filtran por cod_institucional, o por
-    nombre_ie/region/distrito si cod_institucional es None.
+    compuesta nombre_ie|ugel|región|distrito si no hay), usada como
+    institución y para logs/caché. Las queries reales contra base_ebr_IA
+    y vw_processing_brechas_jec filtran por cod_institucional, o por
+    nombre_ie/ugel/region/distrito si cod_institucional es None.
     """
     todas_las_filas = await obtener_filas_vista(
-        nombre_ie, region, distrito, cod_institucional=cod_institucional
+        nombre_ie, ugel, region, distrito, cod_institucional=cod_institucional
     )
     if not todas_las_filas:
         raise SinDatosDisponiblesError(f"Sin datos en la vista para {cod_modular}")
@@ -1472,7 +1564,7 @@ async def generar_reporte(
     todas_las_filas = _excluir_docentes_con_registro_incompleto(todas_las_filas)
 
     n_docentes_total = await contar_docentes_total(
-        nombre_ie, region, distrito, cod_institucional=cod_institucional
+        nombre_ie, ugel, region, distrito, cod_institucional=cod_institucional
     )
     estados = clasificar_evidencias_por_estado(todas_las_filas, n_docentes_total)
     n_evidencias_validas = estados["n_validas"]
@@ -1488,6 +1580,21 @@ async def generar_reporte(
             n_evidencias_validas=n_evidencias_validas,
             pct_cobertura=pct_cobertura,
         )
+
+    # Adenda Técnica F4-ADENDA-EMISION-RI-EBRJEC26 v1.0: clasifica la
+    # cobertura por bandas (reemplaza la tabla fija 100%/70-99%/<70% de
+    # la ficha técnica original, sección 11 de la Adenda) y, si queda
+    # "bajo umbral", arma la advertencia obligatoria que debe mostrarse
+    # al inicio del reporte (RE-04, sección 8.1). muestra_suficiente se
+    # mantiene sin cambios para las reglas de lenguaje del prompt.
+    cobertura = _clasificar_cobertura(n_evidencias_validas, n_docentes_total)
+    advertencia_cobertura = (
+        _construir_advertencia_cobertura(
+            n_evidencias_validas, cobertura["umbral_requerido"], n_docentes_total, pct_cobertura
+        )
+        if cobertura["estado_cobertura"] == "COB_BAJO_UMBRAL"
+        else None
+    )
 
     filas_ok = filas_validas(todas_las_filas)
     filas_por_docente = agrupar_por_docente(filas_ok)
@@ -1555,6 +1662,10 @@ async def generar_reporte(
         "n_sin_entrega": estados["n_sin_entrega"],
         "pct_cobertura": pct_cobertura,
         "muestra_suficiente": muestra_suficiente,
+        "banda_aplicada": cobertura["banda_aplicada"],
+        "umbral_requerido": cobertura["umbral_requerido"],
+        "estado_cobertura": cobertura["estado_cobertura"],
+        "advertencia_cobertura": advertencia_cobertura,
         "distribucion_por_aspecto": variables["distribucion_por_aspecto"],
         "necesidades_frecuentes": variables["necesidades_frecuentes"],
         "fortalezas": variables["fortalezas"],
@@ -1572,17 +1683,22 @@ async def generar_reporte(
 # =============================================================================
 
 async def obtener_reporte_guardado(cod_modular: str) -> Optional[dict]:
-    """Trae la fila de f4_reportes_directivo para esta IE, sin importar el
-    estado (generado, muestra_insuficiente, sin_datos) -- o None si esta
-    IE nunca tuvo ni un intento de generación."""
+    """Trae la fila de f4_reportes_directivo para esta IE Y para
+    tipo_reporte=RI1 (ver TIPO_REPORTE -- la tabla es compartida con
+    otros reportes de la familia F4, EBR y JEC), sin importar el estado
+    (generado, muestra_insuficiente, sin_datos) -- o None si esta IE
+    nunca tuvo ni un intento de generación de ESTE reporte."""
     query = """
         SELECT id, cod_modular, estado, n_docentes_evaluados, reporte_json,
                fecha_generacion, fecha_actualizacion
         FROM f4_reportes_directivo
         WHERE cod_modular = %(cod_modular)s
+          AND tipo_reporte = %(tipo_reporte)s
     """
     async with pool_cache.connection() as conn:
-        return await (await conn.execute(query, {"cod_modular": cod_modular})).fetchone()
+        return await (await conn.execute(
+            query, {"cod_modular": cod_modular, "tipo_reporte": TIPO_REPORTE}
+        )).fetchone()
 
 
 async def guardar_estado_reporte(
@@ -1596,15 +1712,19 @@ async def guardar_estado_reporte(
     de 'generado', 'muestra_insuficiente', 'sin_datos'. reporte_json
     solo se pasa (y solo debe pasarse) cuando estado='generado'.
 
-    Como hay una sola fila por cod_modular, esto cubre tanto el primer
-    intento (exitoso o no) como los siguientes -- INSERT si es la
-    primera vez que se toca esta IE, UPDATE si ya existía una fila
-    (sin importar cuál era su estado anterior).
+    Como hay una sola fila por (cod_modular, tipo_reporte) --
+    CONSTRAINT uq_cod_modular_tipo_reporte UNIQUE (cod_modular,
+    tipo_reporte) -- esto cubre tanto el primer intento (exitoso o no)
+    como los siguientes -- INSERT si es la primera vez que se toca esta
+    IE para este tipo de reporte, UPDATE si ya existía una fila (sin
+    importar cuál era su estado anterior). La tabla es compartida con
+    otros reportes de la familia F4 (ej. RI2), así que tipo_reporte
+    evita que se pisen entre sí para la misma IE.
     """
     query = """
-        INSERT INTO f4_reportes_directivo (cod_modular, estado, n_docentes_evaluados, reporte_json)
-        VALUES (%(cod_modular)s, %(estado)s, %(n)s, %(reporte)s)
-        ON CONFLICT (cod_modular) DO UPDATE SET
+        INSERT INTO f4_reportes_directivo (cod_modular, tipo_reporte, estado, n_docentes_evaluados, reporte_json)
+        VALUES (%(cod_modular)s, %(tipo_reporte)s, %(estado)s, %(n)s, %(reporte)s)
+        ON CONFLICT (cod_modular, tipo_reporte) DO UPDATE SET
             estado = EXCLUDED.estado,
             n_docentes_evaluados = EXCLUDED.n_docentes_evaluados,
             reporte_json = COALESCE(EXCLUDED.reporte_json, f4_reportes_directivo.reporte_json),
@@ -1614,6 +1734,7 @@ async def guardar_estado_reporte(
     async with pool_cache.connection() as conn:
         row = await (await conn.execute(query, {
             "cod_modular": cod_modular,
+            "tipo_reporte": TIPO_REPORTE,
             "estado": estado,
             "n": n_docentes_evaluados,
             "reporte": Jsonb(reporte_json) if reporte_json is not None else None,
@@ -1626,17 +1747,20 @@ async def guardar_estado_reporte(
 async def registrar_consulta(
     cod_modular: str, userid_directivo: int, courseid: int, cmid: int, id_reporte_directivo: int
 ) -> None:
-    """Asocia un directivo con el reporte de su IE. Un registro único por
-    (cod_modular, userid_directivo) -- cada llamada (upsert) actualiza
-    fecha_consulta a la fecha/hora actual, para que la columna refleje la
-    ÚLTIMA vez que este directivo pasó por POST /reporte/generar, no solo
-    la primera (antes usaba DO NOTHING, que dejaba la fecha congelada en
-    el primer registro)."""
+    """Asocia un directivo con el reporte de su IE para tipo_reporte=RI1.
+    Un registro único por (cod_modular, userid_directivo, tipo_reporte)
+    -- CONSTRAINT uq_cod_modular_userid_tipo -- cada llamada (upsert)
+    actualiza fecha_consulta a la fecha/hora actual, para que la columna
+    refleje la ÚLTIMA vez que este directivo pasó por POST
+    /reporte/generar, no solo la primera (antes usaba DO NOTHING, que
+    dejaba la fecha congelada en el primer registro). tipo_reporte evita
+    que la asociación de un directivo a RI1 se mezcle con su asociación
+    a otro reporte (ej. RI2) para la misma IE."""
     query = """
         INSERT INTO f4_consultas_directivo
-            (cod_modular, userid_directivo, courseid, cmid, id_reporte_directivo)
-        VALUES (%(cod_modular)s, %(userid)s, %(courseid)s, %(cmid)s, %(id_reporte)s)
-        ON CONFLICT (cod_modular, userid_directivo) DO UPDATE SET
+            (cod_modular, tipo_reporte, userid_directivo, courseid, cmid, id_reporte_directivo)
+        VALUES (%(cod_modular)s, %(tipo_reporte)s, %(userid)s, %(courseid)s, %(cmid)s, %(id_reporte)s)
+        ON CONFLICT (cod_modular, userid_directivo, tipo_reporte) DO UPDATE SET
             courseid = EXCLUDED.courseid,
             cmid = EXCLUDED.cmid,
             id_reporte_directivo = EXCLUDED.id_reporte_directivo,
@@ -1645,6 +1769,7 @@ async def registrar_consulta(
     async with pool_cache.connection() as conn:
         await conn.execute(query, {
             "cod_modular": cod_modular,
+            "tipo_reporte": TIPO_REPORTE,
             "userid": userid_directivo,
             "courseid": courseid,
             "cmid": cmid,
@@ -1657,25 +1782,25 @@ async def registrar_consulta(
 # Puntos de entrada
 # =============================================================================
 
-def _debe_esperar_mas_docentes(n_actual: int, pct_cobertura_actual: int) -> bool:
+def _debe_esperar_mas_docentes(n_actual: int, n_total: int) -> bool:
     """Decide si /reporte/consultar debe indicarle al frontend que espere
     más docentes evaluados en vez de generar el reporte ya.
 
-    Se exige alcanzar AMBOS umbrales -- el piso absoluto
-    (UMBRAL_MUESTRA_INSUFICIENTE) y el de cobertura proporcional
-    (UMBRAL_COBERTURA_MINIMA_PCT) -- porque el piso absoluto por sí solo
-    es insuficiente en IEs grandes: 5 docentes evaluados en una IE de 100
-    son solo 5% de cobertura, poco representativo para un reporte
-    institucional.
-
-    Excepción: si ya se evaluó al 100% de la plana docente de la IE, se
-    genera igual aunque no se hayan alcanzado ni los 5 ni el 35% -- en
-    IEs muy pequeñas (menos docentes en total que el piso o que el %
-    mínimo) ninguno de los dos umbrales se alcanzaría nunca, así que
-    evaluar a todos sin excepción siempre habilita el reporte."""
-    if pct_cobertura_actual >= 100:
+    RE-04 de la Adenda Técnica F4-ADENDA-EMISION-RI-EBRJEC26 v1.0: ya NO
+    se espera cuando la cobertura está "bajo umbral" (COB_BAJO_UMBRAL) --
+    el reporte se emite igual, con la advertencia de cobertura
+    correspondiente (ver _construir_advertencia_cobertura en
+    generar_reporte). Solo se sigue esperando en COB_CONFIDENCIAL:
+      - N >= 5 pero todavía hay menos de 5 evidencias válidas: hay que
+        esperar a llegar a 5 (ahí deja de ser confidencial).
+      - N < 5 (banda B0): nunca deja de ser confidencial por más
+        evidencias que se junten (RE-05, CP18) -- la única salida es
+        evaluar al 100% de la plana docente, igual que el
+        comportamiento anterior a esta adenda para IEs muy pequeñas."""
+    estado = _clasificar_cobertura(n_actual, n_total)["estado_cobertura"]
+    if estado != "COB_CONFIDENCIAL":
         return False
-    return n_actual < UMBRAL_MUESTRA_INSUFICIENTE or pct_cobertura_actual < UMBRAL_COBERTURA_MINIMA_PCT
+    return not (n_total > 0 and n_actual >= n_total)
 
 
 async def consultar_reporte_existente(userid: int) -> dict:
@@ -1695,16 +1820,17 @@ async def consultar_reporte_existente(userid: int) -> dict:
          cambió -> accion="generar" (el frontend dispara la
          regeneración).
       4. No hay reporte, y todavía no se alcanzan los umbrales mínimos
-         -> accion="esperar_docentes". Si una IE ya evaluó al 100% de su
-         plana docente (aunque nunca llegue a los umbrales mínimos por
-         tener muy pocos docentes en total), no tiene sentido esperar
-         más -- se genera igual, marcado como muestra_suficiente=False
-         en el reporte.
+         (estado_cobertura="COB_CONFIDENCIAL") -> accion="esperar_docentes".
+         Desde la Adenda Técnica F4-ADENDA-EMISION-RI-EBRJEC26 v1.0 (RE-04),
+         ya NO se espera en COB_BAJO_UMBRAL -- el reporte se genera igual,
+         con advertencia de cobertura (ver generar_reporte).
 
     Retorna siempre {"accion": ..., "reporte": ... | None,
     "n_docentes_evaluados": ..., "n_docentes_total": ...,
-    "pct_cobertura_actual": ...} -- los dos últimos permiten que el
-    frontend explique el motivo de la espera (ver showEsperandoDocentes).
+    "pct_cobertura_actual": ..., "banda_aplicada": ...,
+    "umbral_requerido": ..., "estado_cobertura": ...} -- estos últimos
+    permiten que el frontend explique el motivo de la espera (ver
+    showEsperandoDocentes).
     """
     inicio = time.monotonic()
     log.info("reporte_consultado", userid=userid)
@@ -1715,31 +1841,41 @@ async def consultar_reporte_existente(userid: int) -> dict:
     guardado = await obtener_reporte_guardado(cod_modular)
 
     n_actual = await contar_docentes_evaluados(
-        ie["nombre_ie"], ie["region"], ie["distrito"], cod_institucional=ie["cod_institucional"]
+        ie["nombre_ie"], ie["ugel"], ie["region"], ie["distrito"],
+        cod_institucional=ie["cod_institucional"],
     )
     n_total = await contar_docentes_total(
-        ie["nombre_ie"], ie["region"], ie["distrito"], cod_institucional=ie["cod_institucional"]
+        ie["nombre_ie"], ie["ugel"], ie["region"], ie["distrito"],
+        cod_institucional=ie["cod_institucional"],
     )
     pct_cobertura_actual = round(100 * n_actual / n_total) if n_total > 0 else 0
+    cobertura = _clasificar_cobertura(n_actual, n_total)
 
     duracion_ms = round((time.monotonic() - inicio) * 1000)
 
+    def _respuesta(accion: str, reporte: Optional[dict]) -> dict:
+        return {
+            "accion": accion,
+            "reporte": reporte,
+            "n_docentes_evaluados": n_actual,
+            "n_docentes_total": n_total,
+            "pct_cobertura_actual": pct_cobertura_actual,
+            "banda_aplicada": cobertura["banda_aplicada"],
+            "umbral_requerido": cobertura["umbral_requerido"],
+            "estado_cobertura": cobertura["estado_cobertura"],
+        }
+
     if guardado is None:
-        if _debe_esperar_mas_docentes(n_actual, pct_cobertura_actual):
+        if _debe_esperar_mas_docentes(n_actual, n_total):
             log.info(
                 "consulta_esperar_docentes",
                 cod_modular=cod_modular,
                 n_docentes_evaluados=n_actual,
                 pct_cobertura=pct_cobertura_actual,
+                estado_cobertura=cobertura["estado_cobertura"],
                 duracion_ms=duracion_ms,
             )
-            return {
-                "accion": "esperar_docentes",
-                "reporte": None,
-                "n_docentes_evaluados": n_actual,
-                "n_docentes_total": n_total,
-                "pct_cobertura_actual": pct_cobertura_actual,
-            }
+            return _respuesta("esperar_docentes", None)
 
         log.info(
             "consulta_debe_generar",
@@ -1748,13 +1884,7 @@ async def consultar_reporte_existente(userid: int) -> dict:
             n_docentes_evaluados=n_actual,
             duracion_ms=duracion_ms,
         )
-        return {
-            "accion": "generar",
-            "reporte": None,
-            "n_docentes_evaluados": n_actual,
-            "n_docentes_total": n_total,
-            "pct_cobertura_actual": pct_cobertura_actual,
-        }
+        return _respuesta("generar", None)
 
     if n_actual != guardado["n_docentes_evaluados"]:
         log.info(
@@ -1765,22 +1895,10 @@ async def consultar_reporte_existente(userid: int) -> dict:
             n_docentes_evaluados=n_actual,
             duracion_ms=duracion_ms,
         )
-        return {
-            "accion": "generar",
-            "reporte": None,
-            "n_docentes_evaluados": n_actual,
-            "n_docentes_total": n_total,
-            "pct_cobertura_actual": pct_cobertura_actual,
-        }
+        return _respuesta("generar", None)
 
     log.info("consulta_mostrar_vigente", cod_modular=cod_modular, duracion_ms=duracion_ms)
-    return {
-        "accion": "mostrar",
-        "reporte": guardado["reporte_json"],
-        "n_docentes_evaluados": n_actual,
-        "n_docentes_total": n_total,
-        "pct_cobertura_actual": pct_cobertura_actual,
-    }
+    return _respuesta("mostrar", guardado["reporte_json"])
 
 
 async def obtener_o_generar_reporte(userid: int, courseid: int, cmid: int) -> dict:
@@ -1807,9 +1925,10 @@ async def obtener_o_generar_reporte(userid: int, courseid: int, cmid: int) -> di
     ie = await resolver_cod_modular(userid)
     cod_modular = ie["cod_modular"]
     nombre_ie = ie["nombre_ie"]
+    ugel = ie["ugel"]
+    cod_institucional = ie["cod_institucional"]
     region = ie["region"]
     distrito = ie["distrito"]
-    cod_institucional = ie["cod_institucional"]
 
     guardado = await obtener_reporte_guardado(cod_modular)
 
@@ -1829,7 +1948,7 @@ async def obtener_o_generar_reporte(userid: int, courseid: int, cmid: int) -> di
         # docente tuviera una carga a medias, aunque nada hubiera
         # cambiado realmente.
         n_actual = await contar_docentes_evaluados(
-            nombre_ie, region, distrito, cod_institucional=cod_institucional
+            nombre_ie, ugel, region, distrito, cod_institucional=cod_institucional
         )
         debe_generar = n_actual != guardado["n_docentes_evaluados"]
         if debe_generar:
@@ -1848,7 +1967,7 @@ async def obtener_o_generar_reporte(userid: int, courseid: int, cmid: int) -> di
         log.info("cache_miss_o_reintento", cod_modular=cod_modular)
         try:
             reporte = await generar_reporte(
-                cod_modular, nombre_ie, region, distrito, cod_institucional=cod_institucional
+                cod_modular, nombre_ie, ugel, region, distrito, cod_institucional=cod_institucional
             )
         except SinDatosDisponiblesError:
             if guardado is not None and guardado["estado"] == "generado":
