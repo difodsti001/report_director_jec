@@ -96,9 +96,9 @@ class MuestraInsuficienteError(Exception):
 # Zona horaria
 # =============================================================================
 
-# Perú (todo el territorio, incluida Lima) usa UTC-5 todo el año, sin
+# Perú (todo el territorio) usa UTC-5 todo el año, sin
 # horario de verano -- un offset fijo es correcto y no requiere una base
-# de datos de zonas horarias (zoneinfo/tzdata) instalada en el servidor.
+# de datos de zonas horarias instalada en el servidor.
 ZONA_LIMA = timezone(timedelta(hours=-5))
 
 
